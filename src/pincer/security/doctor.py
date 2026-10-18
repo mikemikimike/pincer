@@ -1429,7 +1429,7 @@ class SecurityDoctor:
         )
 
     def _check_skills_dir_permissions(self, cfg: Settings | None = None) -> CheckResult:
-        from pincer.tools.skills.storage import is_remote_uri
+        from pincer.storage.clients import is_remote_uri
 
         if isinstance(self.skills_dir, str) and is_remote_uri(self.skills_dir):
             return self._check_remote_skills_root(self.skills_dir, self._cfg(cfg))

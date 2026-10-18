@@ -32,6 +32,7 @@ from pincer.api.ops import router as ops_router
 from pincer.api.public_demo import router as public_demo_router
 from pincer.api.schedules import router as schedules_router
 from pincer.api.skills import router as skills_router
+from pincer.api.storage import router as storage_router
 from pincer.api.telephony import router as telephony_router
 from pincer.api.voice import router as voice_api_router
 from pincer.config import get_settings_relaxed
@@ -243,6 +244,7 @@ def create_app() -> FastAPI:
     app.include_router(identity_router)
     app.include_router(schedules_router)
     app.include_router(skills_router)
+    app.include_router(storage_router)
     app.include_router(integrations_router)
     app.include_router(chat_router)
     app.include_router(voice_api_router)

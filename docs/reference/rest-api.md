@@ -424,6 +424,109 @@ List the agent's built-in tools, configured Google Workspace / Slack integration
 
 ---
 
+## Storage
+
+Browse and manage files under the **storage root**: `PINCER_STORAGE_ROOT` (a local path or an `s3://` / `az://` / `gs://` URI). When it is unset and `skills_dir` is a cloud URI, the root is that bucket or container; otherwise it is `<data_dir>/storage`. Cloud roots use the same `PINCER_STORAGE_*` credentials as remote skill roots.
+
+Keys are POSIX paths relative to the root (`reports/q1.pdf`; `""` is the root). Absolute keys, `~`, `..` segments and scheme-qualified keys are refused with `400`.
+
+**Protected prefixes.** When the skills dir lies under the root, its prefix is protected: deleting or moving it, anything inside it, or any of its parent folders is a `403`. Files inside it can still be read, uploaded and edited.
+
+Every route needs a bearer token, except `/api/storage/signed/{token}`. The routes that change something (`PUT /text`, `POST /upload`, `POST /folders`, `POST /move`, `DELETE /object`) also need a signed-in identity when `PINCER_AUTH_DISABLED` is set.
+
+| Status | Meaning |
+|---|---|
+| `400` | Invalid key (traversal, absolute path, scheme), or a folder moved into itself |
+| `403` | Protected prefix, or an invalid signed link |
+| `404` | No such file or folder |
+| `409` | Already exists (upload, move, mkdir without `overwrite`), or the file changed since it was read (`PUT /text` with a stale `etag`) |
+| `410` | The signed link has expired |
+| `413` | Text larger than 2 MB, or an upload larger than `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` |
+| `415` | Not a UTF-8 text file |
+| `503` | Storage unreachable or misconfigured; the detail names the `PINCER_STORAGE_*` settings to check |
+
+### `GET /api/storage`
+
+```json
+{"backend": "s3", "root": "s3://acme/", "protected": ["team/skills"], "presign_ttl": 900, "max_text_bytes": 2097152,
+ "max_upload_bytes": 20971520}
+```
+
+`backend` is `file`, `s3`, `az` or `gs`.
+
+### `GET /api/storage/list?prefix=reports&limit=50&cursor=…`
+
+One page of the folders and files directly inside `prefix`: folders first, then files, each sorted by name (case-insensitive). `limit` is the page size, 50 by default and at most 100 (more is a `422`). Pass the response's `next_cursor` as `cursor` to get the next page; it is `null` on the last one. A cursor names the last entry served, not a position, so entries added or deleted between pages are neither repeated nor skipped. A cursor that cannot be read is a `400`.
+
+A folder with more than 100,000 entries can only be paged through up to that point; `truncated` is then `true`. Empty folders on object stores are a zero-byte `.keep` marker, which is not listed.
+
+```json
+{
+  "prefix": "reports",
+  "folders": [{"key": "reports/2026", "name": "2026", "protected": false}],
+  "files": [
+    {"key": "reports/q1.pdf", "name": "q1.pdf", "size": 48213, "last_modified": "2026-10-01T09:12:00+00:00",
+     "content_type": "application/pdf", "protected": false}
+  ],
+  "next_cursor": "WzEsInExLnBkZiJd",
+  "truncated": false
+}
+```
+
+### `GET /api/storage/presign?key=…&disposition=inline|attachment`
+
+A link that serves the file without a bearer token, valid for `PINCER_STORAGE_PRESIGN_TTL` seconds (default 900), for `<img src>`, downloads and "open in new tab".
+
+```json
+{"url": "https://acme.s3.amazonaws.com/reports/q1.pdf?X-Amz-Expires=900&…", "expires_at": "2026-10-18T16:23:36+00:00"}
+```
+
+Cloud roots return the provider's presigned URL; S3 links also carry the requested `Content-Disposition`. Local roots return a path on this API, `/api/storage/signed/<token>`, which the client resolves against the API's base URL.
+
+### `GET /api/storage/signed/{token}`
+
+Public. Serves a file of a **local** root from a link minted by `/presign`. The token is an HMAC over the key, the expiry and the disposition, keyed with the JWT secret. A tampered token is `403`, an expired one `410`. Cloud roots answer `404` here: their links point at the provider.
+
+### `GET /api/storage/download?key=…`
+
+The file as an attachment, with the bearer token. A fallback for clients that cannot use `/presign`.
+
+Served files (here and through signed links) carry `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`, so an uploaded HTML or SVG file cannot run script on the API's origin.
+
+### `GET /api/storage/text?key=…`
+
+A UTF-8 text file of at most 2 MB, for the editor. The `etag` is a hash of the content.
+
+```json
+{"key": "notes/plan.md", "content": "# Plan\n…", "etag": "8a5d8b28d66ae90b5876fe0337b963d9", "size": 812}
+```
+
+### `PUT /api/storage/text`
+
+```json
+{"key": "notes/plan.md", "content": "# Plan v2\n…", "etag": "8a5d8b28d66ae90b5876fe0337b963d9"}
+```
+
+Saves the file and returns `{"key", "etag", "size"}`. With `etag`, the save is refused with `409` if the file changed (or was deleted) since it was read. Omit `etag` to overwrite unconditionally, or to create a new file.
+
+### `POST /api/storage/upload?prefix=…&overwrite=false`
+
+Multipart form with one or more `files` parts. A file name may carry subfolders (`2026/q1.pdf`, from a folder pick); they are created. Each file may be at most `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` (default 20 MB), else `413`, and nothing of it is stored. An existing file is a `409` unless `overwrite=true`. Either way, files earlier in the same request are already stored. Returns `{"files": [<file entry>, …]}`.
+
+### `POST /api/storage/folders`
+
+`{"prefix": "reports/2026"}` → `201` with the folder entry. `409` if it exists.
+
+### `POST /api/storage/move`
+
+`{"from": "reports/q1.pdf", "to": "archive/q1.pdf", "overwrite": false}` moves or renames a file or a folder. Object stores copy and then delete, object by object. `409` if the target exists and `overwrite` is `false`; `403` if either side is protected.
+
+### `DELETE /api/storage/object?key=…` / `?prefix=…`
+
+Deletes a file (`key`) or a folder and everything in it (`prefix`). Pass exactly one. Returns `{"key": "reports", "kind": "folder"}`.
+
+---
+
 ## Audit
 
 ### `GET /api/audit?limit=50&tool=shell_exec&after=2026-02-25`

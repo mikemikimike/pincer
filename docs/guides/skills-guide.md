@@ -167,6 +167,8 @@ The skill index itself is state, not a cache: one per process, shared by the age
 
 **Scripts.** `run_skill_script` on a remote skill first brings the skill's folder in cloudpathlib's cache up to date: changed files are downloaded again, and files deleted from the bucket are removed. It then runs the script from there, through the same approval gate and sandbox as a local script. There is no separate copy, so editing only a script takes effect on the next run. Object storage keeps no file modes, so non-Python scripts get the owner execute bit restored. If a script changed its own cached files, they are replaced from the bucket on the next run. Avoid `pincer skills rebuild` (or `POST /api/skills/rebuild`) while a remote skill script is running: clearing the cache removes the files that script runs from. Use `--keep-cache` / `?keep_cache=true` if you only need a rescan.
 
+**Browsing the bucket.** The dashboard's Documents view (`/api/storage`, see the [REST API reference](../reference/rest-api.md#storage)) serves the storage root. Set it with `PINCER_STORAGE_ROOT`. Left unset with a remote `skills_dir`, it is the whole bucket or container the skills live in (`s3://my-bucket/` for `s3://my-bucket/team-skills`). Whenever the skills dir is under the storage root, its prefix is **protected**: it, anything inside it and every folder above it cannot be deleted or moved from the browser. Files inside it can still be uploaded and edited; run `pincer skills rebuild` (or `POST /api/skills/rebuild`) afterwards to pick up changed SKILL.md files.
+
 ---
 
 ## Bundled Starter Skills
