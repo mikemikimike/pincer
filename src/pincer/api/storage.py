@@ -32,7 +32,7 @@ from pincer.api.auth import InteractiveIdentity
 from pincer.config import get_settings_relaxed
 from pincer.storage.browser import Download, StorageBrowser, get_storage_browser
 from pincer.storage.clients import STORAGE_HINTS
-from pincer.storage.errors import KeyNotFound, StorageError
+from pincer.storage.errors import KeyNotFound, StorageError, describe
 from pincer.storage.limits import COPY_CHUNK, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_TEXT_BYTES
 from pincer.storage.signing import Disposition
 
@@ -56,7 +56,9 @@ class StorageInfoOut(BaseModel):
     protected: list[str] = Field(description="Root-relative prefixes that cannot be deleted or moved")
     presign_ttl: int = Field(description="Lifetime of presigned links, in seconds")
     max_text_bytes: int
-    max_upload_bytes: int = Field(description="Largest file an upload may carry (PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE)")
+    max_upload_bytes: int = Field(
+        description="Largest file an upload may carry: PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE, at most 5 GiB on S3"
+    )
 
 
 class FolderOut(BaseModel):
@@ -144,11 +146,12 @@ def _http_error(e: Exception, scheme: str) -> HTTPException:
     if isinstance(e, FileNotFoundError):
         return HTTPException(status_code=404, detail="Not found")
     if isinstance(e, FileExistsError | IsADirectoryError | NotADirectoryError):
-        return HTTPException(status_code=409, detail=f"Conflicts with an existing file or folder: {e}")
+        # The OS message names the server's absolute path: leave it out.
+        return HTTPException(status_code=409, detail="Conflicts with an existing file or folder")
     # SDK errors: credentials, a missing bucket, an unreachable endpoint.
     logger.error("Storage operation failed", exc_info=e)
     hint = STORAGE_HINTS.get(scheme, "")
-    return HTTPException(status_code=503, detail=f"Storage unavailable: {type(e).__name__}: {e}. {hint}".strip())
+    return HTTPException(status_code=503, detail=f"Storage unavailable: {describe(e)}. {hint}".strip())
 
 
 def storage_browser() -> StorageBrowser:

@@ -37,6 +37,7 @@ from pincer.storage.errors import (
     StorageError,
     StorageUnavailable,
     TooLarge,
+    describe,
 )
 from pincer.storage.keys import (
     FOLDER_MARKER,
@@ -171,7 +172,7 @@ class StorageBrowser:
             "protected": self.protected,
             "presign_ttl": self.presign_ttl,
             "max_text_bytes": MAX_TEXT_BYTES,
-            "max_upload_bytes": self.upload_max_bytes,
+            "max_upload_bytes": self._upload_limit(),
         }
 
     # ── Paths ──
@@ -410,8 +411,13 @@ class StorageBrowser:
     # ── Writing ──
 
     @staticmethod
-    def _lock(key: str) -> threading.Lock:
-        return _KEY_LOCKS[hash(_fold(key)) % len(_KEY_LOCKS)]
+    def _lock(key: str, path: StoragePath) -> threading.Lock:
+        """The lock of one file. A local file is named by its confined path,
+        where symlinks are resolved: `alias/doc.md` with `alias -> team` is
+        `team/doc.md`. Folding covers the case and Unicode variants a
+        case-insensitive disk also treats as one name."""
+        name = str(path) if isinstance(path, Path) else key
+        return _KEY_LOCKS[hash(_fold(name)) % len(_KEY_LOCKS)]
 
     def _store(
         self, path: StoragePath, source: IO[bytes], *, if_version: object = None, if_absent: bool = False
@@ -457,7 +463,7 @@ class StorageBrowser:
         path = self.confine(normalized, allow_root=False)
         if path.is_dir():
             raise KeyConflict(f"{key} is a folder")
-        with self._lock(normalized):
+        with self._lock(normalized, path):
             if expected_etag is None:
                 self._store(path, io.BytesIO(data))
                 return {"key": normalized, "etag": etag(data), "size": len(data)}
@@ -484,23 +490,38 @@ class StorageBrowser:
         """Store uploaded files under `prefix`. A name may carry subfolders
         ("reports/q1.pdf", from a folder pick); they are kept.
 
-        Every file is checked before any is written: a bad name (400), a file
-        that exists without `overwrite` or a folder in the way (409), and one
-        over the size limit (413) refuse the whole upload. Only a failure while
-        writing (another writer taking a name first, an unavailable store) can
-        leave earlier files stored; its message names them.
+        Every file is checked before any is written, and any of these refuses
+        the whole upload: a bad name (400); a file that exists without
+        `overwrite`, a folder in the way, a file where a folder is needed (an
+        existing one, or another file of the same upload: `x` and `x/y`) or the
+        same name twice (409); one over the size limit (413). Only a failure
+        while writing (another writer taking a name first, an unavailable
+        store) can leave earlier files stored; its message names them.
         """
         base = normalize_key(prefix)
-        planned: list[tuple[str, StoragePath, IO[bytes]]] = []
-        seen: set[str] = set()
-        for filename, source in files:
+        keys: list[str] = []
+        for filename, _source in files:
             relative = normalize_key(filename or "")
             if not relative:
                 raise InvalidKey("An uploaded file has no name")
-            key = join_key(base, relative)
-            if _fold(key) in seen:
-                raise KeyConflict(f"{key} is in the upload twice")
-            seen.add(_fold(key))
+            keys.append(join_key(base, relative))
+        folded = {_fold(key) for key in keys}
+        if len(folded) < len(keys):
+            twice = next(key for i, key in enumerate(keys) if _fold(key) in {_fold(k) for k in keys[:i]})
+            raise KeyConflict(f"{twice} is in the upload twice")
+
+        planned: list[tuple[str, StoragePath, IO[bytes]]] = []
+        is_file: dict[str, bool] = {}
+        for key, (_filename, source) in zip(keys, files, strict=True):
+            parts = key.split("/")
+            for depth in range(1, len(parts)):
+                folder = "/".join(parts[:depth])
+                if _fold(folder) in folded:
+                    raise KeyConflict(f"{folder} is both a file and a folder in this upload")
+                if folder not in is_file:
+                    is_file[folder] = self.confine(folder).is_file()
+                if is_file[folder]:
+                    raise KeyConflict(f"{folder} is a file, so {key} cannot be stored under it")
             path = self.confine(key, allow_root=False)
             if path.is_dir():
                 raise KeyConflict(f"{key} is a folder")
@@ -515,14 +536,19 @@ class StorageBrowser:
             stored: list[dict[str, Any]] = []
             for (key, path, _source), body in zip(planned, bodies, strict=True):
                 try:
-                    with self._lock(key):
+                    with self._lock(key, path):
                         self._store(path, body, if_absent=not overwrite)
                 except Exception as e:
                     if not stored:
                         raise
                     names = ", ".join(entry["key"] for entry in stored)
-                    error = type(e) if isinstance(e, StorageError) else StorageUnavailable
-                    raise error(f"Storing {key} failed ({e}); stored before it: {names}") from e
+                    error: type[StorageError] = StorageUnavailable
+                    if isinstance(e, StorageError):
+                        error = type(e)
+                    elif isinstance(e, FileExistsError | IsADirectoryError | NotADirectoryError):
+                        error = KeyConflict
+                    reason = str(e) if isinstance(e, StorageError) else describe(e)
+                    raise error(f"Storing {key} failed ({reason}); stored before it: {names}") from e
                 stored.append(self._file_entry(key, path))
             return stored
         finally:
@@ -530,13 +556,20 @@ class StorageBrowser:
                 if body is not source:
                     body.close()
 
+    def _upload_limit(self) -> int:
+        """`upload_max_bytes`, or less where the store takes less in one write (S3: 5 GiB)."""
+        if isinstance(self.root, Path):
+            return self.upload_max_bytes
+        store_max = self._cloud().max_object_bytes
+        return self.upload_max_bytes if store_max is None else min(self.upload_max_bytes, store_max)
+
     def _within_upload_limit(self, source: IO[bytes]) -> IO[bytes]:
-        """`source`, refused with TooLarge if it is over `upload_max_bytes`.
+        """`source`, refused with TooLarge if it is over the upload limit.
 
         Checked before anything is written: a failure half-way would store half
         a file. A source that cannot tell its size is spooled first, up to the limit.
         """
-        limit = self.upload_max_bytes
+        limit = self._upload_limit()
         too_large = TooLarge(f"Uploads are limited to {limit} bytes")
         if source.seekable():
             start = source.tell()

@@ -111,6 +111,20 @@ def test_a_root_that_contains_the_data_dir_is_refused(tmp_path: Path, root: str)
         resolve_storage_root(_settings(data, storage_root=str(data / root)))
 
 
+def test_a_root_that_contains_the_data_dir_under_another_case_is_refused(tmp_path: Path) -> None:
+    """`resolve()` keeps the case it was given; on a case-insensitive disk
+    `CASE-PROBE` is `case-probe`, the data dir's parent."""
+    (tmp_path / "probe").touch()
+    if not (tmp_path / "PROBE").exists():
+        pytest.skip("needs a case-insensitive filesystem")
+    data = tmp_path / "case-probe" / "data"
+    data.mkdir(parents=True)
+    settings = _settings(data, storage_root=str(tmp_path / "CASE-PROBE"))
+    with pytest.raises(StorageUnavailable, match="contains the data dir"):
+        resolve_storage_root(settings)
+    assert SecurityDoctor()._check_storage_root(settings).status == CheckStatus.CRITICAL
+
+
 # ── Doctor ───────────────────────────────────────────────────────────────────
 
 

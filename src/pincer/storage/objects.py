@@ -36,9 +36,33 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Served inline from a cloud origin, these could run script there: S3 links
-#: to them always download (a provider link carries none of the API's headers).
-_ACTIVE_TYPES = frozenset({"text/html", "image/svg+xml", "application/xhtml+xml", "application/xml", "text/xml"})
+#: What an S3 link may serve inline. Anything else could run script on the
+#: bucket's origin, which sends none of the API's headers: HTML, SVG and every
+#: `*+xml` / `*/xml` type (browsers render those as XML, XHTML script included).
+#: So S3 links to anything else always download.
+_INLINE_TYPES = frozenset(
+    {
+        "application/pdf",
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/bmp",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+    }
+)
+#: Largest object S3 takes in one PUT.
+_S3_MAX_PUT_BYTES = 5 * 1024**3
+
+
+def _inline_safe(content_type: str) -> bool:
+    return content_type in _INLINE_TYPES or content_type.startswith(("audio/", "video/"))
+
 
 type ObjectIO = PathObjects | SdkObjects
 
@@ -66,6 +90,9 @@ class PathObjects:
     its own below it (cloudpathlib's local test clients). The conditions are
     checked before the write, not by the store, so only the browser's
     in-process lock keeps the check and the write together."""
+
+    #: Largest object one write may store; None for no limit of the store's own.
+    max_object_bytes: int | None = None
 
     def read(self, path: CloudPath) -> tuple[bytes, object]:
         """The object's content, and a version to pass back as `if_version`."""
@@ -114,6 +141,9 @@ class SdkObjects:
     whether an error is that condition failing.
     """
 
+    #: Largest object one write may store; None for no limit of the store's own.
+    max_object_bytes: int | None = None
+
     def read(self, path: CloudPath) -> tuple[bytes, object]:
         raise NotImplementedError
 
@@ -149,7 +179,14 @@ class SdkObjects:
 
 
 class S3Objects(SdkObjects):
-    """S3 through boto3: `IfMatch` on the ETag, `IfNoneMatch: *` for a new object."""
+    """S3 through boto3: `IfMatch` on the ETag, `IfNoneMatch: *` for a new object.
+
+    One PUT per write, so objects are capped at 5 GiB: multipart uploads would
+    move the condition to CompleteMultipartUpload, and uploads that large do not
+    pass through the API anyway (Starlette spools the whole request first).
+    """
+
+    max_object_bytes = _S3_MAX_PUT_BYTES
 
     def __init__(self, client: Any) -> None:
         self._client = client
@@ -195,20 +232,39 @@ class S3Objects(SdkObjects):
                 **extra,
             )
 
-        if not condition or self._unconditional:
+        if not condition:
             put()
             return
+        if not self._unconditional:
+            try:
+                put(**condition)
+                return
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") != "NotImplemented":
+                    raise
+                self._fall_back(path, e)
+            except ParamValidationError as e:
+                # A botocore from before conditional writes.
+                self._fall_back(path, e)
+        # The store cannot refuse the write, so check first: the browser holds
+        # the file's lock, which keeps the check and the write together here.
+        current = self._etag_of(path)
+        if (absent and current is not None) or (version is not None and current != version):
+            raise KeyConflict(f"{path} changed or already exists")
+        put()
+
+    def _etag_of(self, path: CloudPath) -> str | None:
+        """The object's ETag, or None when there is no such object."""
+        from botocore.exceptions import ClientError
+
         try:
-            put(**condition)
+            head = self._s3.head_object(Bucket=path.bucket, Key=path.key)  # type: ignore[attr-defined]
         except ClientError as e:
-            if e.response.get("Error", {}).get("Code") != "NotImplemented":
-                raise
-            self._fall_back(path, e)
-            put()
-        except ParamValidationError as e:
-            # A botocore from before conditional writes.
-            self._fall_back(path, e)
-            put()
+            if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+        found: str = head["ETag"]
+        return found
 
     def _refused(self, error: Exception) -> bool:
         from botocore.exceptions import ClientError
@@ -219,8 +275,9 @@ class S3Objects(SdkObjects):
         )
 
     def _fall_back(self, path: CloudPath, error: Exception) -> None:
-        """Some S3-compatible servers have no conditional writes: write without
-        them from now on, which leaves only the browser's in-process lock."""
+        """Some S3-compatible servers have no conditional writes: from now on
+        check before writing, which only the browser's in-process lock keeps
+        together with the write."""
         self._unconditional = True
         logger.warning(
             "Storage: %s does not take conditional writes (%s) — saves are only serialised within this process",
@@ -233,7 +290,7 @@ class S3Objects(SdkObjects):
         has none, and S3 takes them as parameters, so a download link
         downloads instead of navigating."""
         content_type = content_type_for(path.name)
-        if content_type in _ACTIVE_TYPES:
+        if not _inline_safe(content_type):
             disposition = "attachment"
         url: str = self._s3_presigner().generate_presigned_url(
             "get_object",

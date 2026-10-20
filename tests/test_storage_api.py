@@ -256,6 +256,21 @@ def test_upload_refused_late_in_the_request_stores_nothing(
     assert (storage.root / "in" / "exists.txt").read_text() == "old"
 
 
+@pytest.mark.parametrize(
+    "files",
+    [[("ok.txt", b"1"), ("a.txt/b.txt", b"2")], [("ok.txt", b"1"), ("x", b"2"), ("x/y", b"3")]],
+    ids=["under-an-existing-file", "file-and-folder-in-one-upload"],
+)
+def test_upload_with_a_file_where_a_folder_is_needed_stores_nothing(
+    storage: Storage, files: list[tuple[str, bytes]]
+) -> None:
+    _write(storage.root, "in/a.txt", "a")
+    res = _upload(storage, "in", *files)
+    assert res.status_code == 409, res.text
+    assert str(storage.root) not in res.json()["detail"]
+    assert not (storage.root / "in" / "ok.txt").exists()
+
+
 def test_upload_refuses_traversing_filename(storage: Storage) -> None:
     assert _upload(storage, "in", ("../escape.txt", b"x")).status_code == 400
 

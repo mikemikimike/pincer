@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -62,9 +63,14 @@ def data_dir_conflict(root: Path, data_dir: Path) -> str | None:
 
     The data dir holds the JWT secret and the database: a root that contains
     it would let any identity download the secret and forge sessions, or
-    overwrite the database. Both paths must be resolved.
+    overwrite the database. Both paths must be resolved. The folders are
+    compared on disk too, by file identity: `resolve()` keeps the case it was
+    given, and on a case-insensitive disk `/srv/APP` is `/srv/app`.
     """
-    if data_dir.is_relative_to(root):
+    contains = data_dir.is_relative_to(root)
+    if not contains and root.exists():
+        contains = any(p.exists() and os.path.samefile(p, root) for p in (data_dir, *data_dir.parents))
+    if contains:
         return f"The storage root {root} contains the data dir {data_dir}, which holds the JWT secret and the database"
     return None
 

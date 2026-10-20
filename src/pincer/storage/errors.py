@@ -45,3 +45,10 @@ class NotText(StorageError):
 
 class StorageUnavailable(StorageError):
     status = 503
+
+
+def describe(error: Exception) -> str:
+    """`error` for a client: an OS error without the server path it names."""
+    if isinstance(error, OSError) and error.strerror:
+        return f"{type(error).__name__}: {error.strerror}"
+    return f"{type(error).__name__}: {error}"

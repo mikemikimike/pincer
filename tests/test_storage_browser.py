@@ -205,6 +205,24 @@ def test_two_saves_with_the_same_etag_cannot_both_succeed(
     assert browser.read_text("doc.md")["etag"] == saved[0]["etag"]
 
 
+def test_saves_through_a_symlinked_name_share_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`alias/doc.md` with `alias -> team` is `team/doc.md`: the two names take one lock."""
+    browser = _local(tmp_path)
+    root = browser.root
+    assert isinstance(root, Path)
+    _write(root / "team" / "doc.md", "v1")
+    (root / "alias").symlink_to(root / "team")
+    tag = browser.read_text("team/doc.md")["etag"]
+
+    results = _race(
+        monkeypatch,
+        "_read",
+        lambda: browser.write_text("team/doc.md", "from alice", tag),
+        lambda: browser.write_text("alias/doc.md", "from bob", tag),
+    )
+    assert sorted(type(r).__name__ for r in results) == ["KeyConflict", "dict"]
+
+
 def test_two_uploads_of_a_new_name_cannot_both_succeed(
     browser: StorageBrowser, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -253,6 +271,24 @@ def test_upload_limit_spools_unseekable_sources(tmp_path: Path) -> None:
     assert not (browser.root / "big.bin").exists()
 
 
+def test_a_filesystem_conflict_while_writing_is_a_conflict_without_the_server_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser = _local(tmp_path)
+    original = StorageBrowser._store
+
+    def store(self: StorageBrowser, path: Any, source: Any, **kwargs: Any) -> None:
+        if path.name == "b.txt":
+            raise FileExistsError(17, "File exists", str(path))
+        original(self, path, source, **kwargs)
+
+    monkeypatch.setattr(StorageBrowser, "_store", store)
+    with pytest.raises(KeyConflict) as caught:
+        browser.upload_files("in", [("a.txt", io.BytesIO(b"a")), ("b.txt", io.BytesIO(b"b"))])
+    assert str(caught.value) == "Storing in/b.txt failed (FileExistsError: File exists); stored before it: in/a.txt"
+    assert str(tmp_path) not in str(caught.value)
+
+
 def test_a_failure_while_writing_names_the_files_already_stored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,7 +301,9 @@ def test_a_failure_while_writing_names_the_files_already_stored(
         original(self, path, source, **kwargs)
 
     monkeypatch.setattr(StorageBrowser, "_store", store)
-    with pytest.raises(Exception, match=r"Storing in/b\.txt failed \(disk full\); stored before it: in/a\.txt"):
+    with pytest.raises(
+        Exception, match=r"Storing in/b\.txt failed \(OSError: disk full\); stored before it: in/a\.txt"
+    ):
         browser.upload_files("in", [("a.txt", io.BytesIO(b"a")), ("b.txt", io.BytesIO(b"b"))])
 
 
@@ -337,9 +375,27 @@ def test_presign_s3_signs_v4_with_response_disposition(tmp_path: Path) -> None:
     assert "eu-central-1" in query["X-Amz-Credential"][0]
 
 
-@pytest.mark.parametrize(("name", "disposition"), [("page.html", "attachment"), ("logo.svg", "attachment")])
-def test_presign_s3_never_serves_active_content_inline(tmp_path: Path, name: str, disposition: str) -> None:
-    """A cloud link carries no CSP: HTML or SVG shown inline could run script on the bucket's origin."""
+@pytest.mark.parametrize(
+    ("name", "disposition"),
+    [
+        ("page.html", "attachment"),
+        ("logo.svg", "attachment"),
+        ("feed.rss", "attachment"),
+        ("doc.rdf", "attachment"),
+        ("f.atom", "attachment"),
+        ("x.xslt", "attachment"),
+        ("m.mathml", "attachment"),
+        ("data.xml", "attachment"),
+        ("script.js", "attachment"),
+        ("photo.png", "inline"),
+        ("report.pdf", "inline"),
+        ("notes.txt", "inline"),
+        ("clip.mp4", "inline"),
+    ],
+)
+def test_presign_s3_serves_inline_only_what_is_safe_inline(tmp_path: Path, name: str, disposition: str) -> None:
+    """A cloud link carries no CSP: HTML, SVG or any XML type shown inline could
+    run script on the bucket's origin, so only an allowlist is served inline."""
     from urllib.parse import parse_qs, urlsplit
 
     client = _s3_client(tmp_path)
@@ -447,23 +503,45 @@ def test_s3_missing_object_is_key_not_found(tmp_path: Path) -> None:
         objects.read(client.CloudPath("s3://b/gone.md"))
 
 
-def test_s3_without_conditional_writes_falls_back_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_s3_without_conditional_writes_checks_before_writing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """After a 501, writes go without conditions, but a create-only write or a
+    versioned save still checks the object first (under the browser's lock)."""
     from botocore.stub import ANY
 
     client, stub, objects = _stubbed_s3(tmp_path)
     path = client.CloudPath("s3://b/new.txt")
-    put = {"Bucket": "b", "Key": "new.txt", "Body": ANY, "ContentType": "text/plain"}
+    key = {"Bucket": "b", "Key": "new.txt"}
+    put = key | {"Body": ANY, "ContentType": "text/plain"}
     stub.add_client_error(
         "put_object", "NotImplemented", http_status_code=501, expected_params=put | {"IfNoneMatch": "*"}
     )
+    stub.add_client_error("head_object", "404", http_status_code=404, expected_params=key)
     stub.add_response("put_object", {}, put)
+    # Now it exists: a second create-only write is refused without writing.
+    stub.add_response("head_object", {"ETag": '"e1"'}, key)
+    # A save of the version that is there goes through; a stale one does not.
+    stub.add_response("head_object", {"ETag": '"e1"'}, key)
     stub.add_response("put_object", {}, put)
-    source = io.BytesIO(b"data")
+    stub.add_response("head_object", {"ETag": '"e2"'}, key)
     with stub:
-        objects.write(path, source, content_type="text/plain", if_absent=True)
-        objects.write(path, io.BytesIO(b"again"), content_type="text/plain", if_absent=True)
+        objects.write(path, io.BytesIO(b"data"), content_type="text/plain", if_absent=True)
+        with pytest.raises(KeyConflict):
+            objects.write(path, io.BytesIO(b"again"), content_type="text/plain", if_absent=True)
+        objects.write(path, io.BytesIO(b"v2"), content_type="text/plain", if_version='"e1"')
+        with pytest.raises(KeyConflict):
+            objects.write(path, io.BytesIO(b"v3"), content_type="text/plain", if_version='"e1"')
     stub.assert_no_pending_responses()
-    assert "does not take conditional writes" in caplog.text
+    assert caplog.text.count("does not take conditional writes") == 1
+
+
+def test_s3_uploads_are_capped_at_one_put(tmp_path: Path) -> None:
+    """S3 takes at most 5 GiB in one PUT: a larger limit is lowered to that,
+    so a bigger file is a 413 before anything is sent."""
+    root = _s3_client(tmp_path).CloudPath("s3://b/")
+    browser = StorageBrowser(root, [], 900, b"k" * 32, upload_max_bytes=10 * 1024**3)
+    assert browser.info()["max_upload_bytes"] == 5 * 1024**3
+    browser.upload_max_bytes = 1024
+    assert browser.info()["max_upload_bytes"] == 1024
 
 
 def test_azure_conditional_writes() -> None:

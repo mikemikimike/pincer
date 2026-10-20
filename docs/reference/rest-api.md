@@ -439,7 +439,7 @@ Every route except `/api/storage/signed/{token}` needs a bearer token. Reading n
 | `400` | Invalid key (traversal, absolute path, scheme), or a folder moved into itself |
 | `403` | Protected prefix, an API key on a route that changes files, or an invalid signed link |
 | `404` | No such file or folder |
-| `409` | Already exists (upload, move, mkdir without `overwrite`), the same name twice in one upload, a move onto a folder that contains the source, or the file changed since it was read (`PUT /text` with a stale `etag`) |
+| `409` | Already exists (upload, move, mkdir without `overwrite`), the same name twice in one upload, a file where a folder is needed, a move onto a folder that contains the source, or the file changed since it was read (`PUT /text` with a stale `etag`) |
 | `410` | The signed link has expired |
 | `413` | Text larger than 2 MB, or an upload larger than `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` |
 | `415` | Not a UTF-8 text file |
@@ -481,7 +481,7 @@ A link that serves the file without a bearer token, valid for `PINCER_STORAGE_PR
 {"url": "https://acme.s3.amazonaws.com/reports/q1.pdf?X-Amz-Expires=900&…", "expires_at": "2026-10-18T16:23:36+00:00"}
 ```
 
-Cloud roots return the provider's presigned URL; S3 links also carry the requested `Content-Disposition`, except that HTML, SVG and XML files always download (`attachment`): the provider serves them without the headers below, from the bucket's origin. Azure and GCS links are served with the content type the object was stored with. Local roots return a path on this API, `/api/storage/signed/<token>`, which the client resolves against the API's base URL.
+Cloud roots return the provider's presigned URL; S3 links also carry the requested `Content-Disposition`, but only files that are safe to show there are served inline: raster images, PDF, plain text, Markdown, CSV, audio and video. Anything else, HTML, SVG and every XML type (`*+xml`, `*/xml`) included, always downloads (`attachment`), because the provider serves it without the headers below, from the bucket's origin. Azure and GCS links are served with the content type the object was stored with. Local roots return a path on this API, `/api/storage/signed/<token>`, which the client resolves against the API's base URL.
 
 ### `GET /api/storage/signed/{token}`
 
@@ -509,13 +509,13 @@ A UTF-8 text file of at most 2 MB, for the editor. The `etag` is a hash of the c
 
 Saves the file and returns `{"key", "etag", "size"}`. With `etag`, the save is refused with `409` if the file changed (or was deleted) since it was read. Omit `etag` to overwrite unconditionally, or to create a new file.
 
-Two saves with the same `etag` cannot both succeed. On S3, Azure and GCS the write is conditional on the version that was checked (`If-Match` / generation match), so this holds across replicas. On a local root, saves of one file are serialised within the Pincer process. An S3-compatible server that rejects conditional writes (`501 NotImplemented`) is logged once and from then on written without them, so its saves are serialised within the process only; a server that silently ignores the headers gets no protection across replicas either.
+Two saves with the same `etag` cannot both succeed. On S3, Azure and GCS the write is conditional on the version that was checked (`If-Match` / generation match), so this holds across replicas. On a local root, saves of one file are serialised within the Pincer process. An S3-compatible server that rejects conditional writes (`501 NotImplemented`) is logged once; from then on each save or create-only upload checks the object (`HEAD`) before writing, which is serialised within the process only. A server that silently ignores the headers gets no protection across replicas either.
 
 ### `POST /api/storage/upload?prefix=…&overwrite=false`
 
 Multipart form with one or more `files` parts. A file name may carry subfolders (`2026/q1.pdf`, from a folder pick); they are created. Returns `{"files": [<file entry>, …]}`.
 
-Every file is checked before any is written, so a refusal stores none of them: a bad name (`400`), an existing file without `overwrite=true` or the same name twice (`409`), or a file over `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` (default 20 MB; `413`). Without `overwrite`, the write itself only creates: a file someone else stores under the same name in the meantime is a `409`, not overwritten. Only a failure while writing (that `409`, or an unavailable store) can leave earlier files of the request stored; the error's detail then names them.
+Every file is checked before any is written, so a refusal stores none of them: a bad name (`400`); an existing file without `overwrite=true`, the same name twice, or a file where a folder is needed — an existing file (`a.txt/b.txt` when `a.txt` is a file) or another file of the same upload (`x` and `x/y`) — (`409`); or a file over `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` (default 20 MB; `413`). On S3 roots the limit is at most 5 GiB, the most one PUT can store; `GET /api/storage` reports the limit in force as `max_upload_bytes`. Without `overwrite`, the write itself only creates: a file someone else stores under the same name in the meantime is a `409`, not overwritten. Only a failure while writing (that `409`, or an unavailable store) can leave earlier files of the request stored; the error's detail then names them.
 
 ### `POST /api/storage/folders`
 
