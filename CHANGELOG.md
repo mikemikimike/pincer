@@ -126,17 +126,28 @@ the dashboard, built on cloudpathlib. See
 - List folders a page at a time (`limit` 50 by default, at most 100, with a
   `next_cursor`), upload (multipart, `409` unless `overwrite`), download,
   create folders, move / rename and delete files or folders.
+- Reading needs any authenticated identity; changing files needs a signed-in
+  session (an API key gets `403`).
 - Uploads are limited by `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` (bytes or a size
-  like `20MB`; default 20 MB); a larger file is a `413` and nothing is stored.
+  like `20MB`; default 20 MB). Every file of a request is checked first: one
+  that is too large (`413`) or already exists (`409`) stores none of them.
 - Read and save UTF-8 text files up to 2 MB, with an `etag` so a save cannot
-  silently overwrite someone else's edit (`409`).
+  silently overwrite someone else's edit (`409`). Cloud roots make the save a
+  conditional write, so this holds across replicas.
 - Presigned links for previews and downloads, valid for
-  `PINCER_STORAGE_PRESIGN_TTL` seconds (default 900): the provider's own for
-  cloud roots, HMAC-signed `/api/storage/signed/{token}` links for local roots.
+  `PINCER_STORAGE_PRESIGN_TTL` seconds (default 900; 60 to 604800 allowed): the
+  provider's own for cloud roots, HMAC-signed `/api/storage/signed/{token}`
+  links for local roots.
 - The skills dir is protected when it lies under the storage root: it, its
-  contents and its parent folders cannot be deleted or moved (`403`).
-- The shared cloud client code moved to `pincer.storage.clients`;
-  `pincer.tools.skills.storage` keeps its names.
+  contents and its parent folders cannot be deleted or moved, and nothing can
+  be moved into it (`403`). On local roots this follows the folder on disk, so
+  case variants and symlinks are refused too.
+- A local storage root that contains the data dir is refused; `pincer doctor`
+  checks for it (`storage_root`).
+- The shared cloud client code moved to `pincer.storage.clients`.
+  `pincer.tools.skills.storage` no longer re-exports `is_remote_uri`; import it
+  from `pincer.storage.clients`.
+- `cloudpathlib` in the `remote-skills` extra is now capped below 0.27.
 
 #### Remote skill roots: S3, Azure Blob Storage and Google Cloud Storage
 

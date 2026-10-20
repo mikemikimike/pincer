@@ -8,6 +8,8 @@ from typing import Any, Self
 from pydantic import BaseModel, Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic.networks import AnyHttpUrl
 
+from pincer.storage.limits import DEFAULT_UPLOAD_MAX_BYTES
+
 
 class LogLevel(StrEnum):
     DEBUG = "DEBUG"
@@ -90,10 +92,11 @@ class CoreSettings(BaseModel):
         default=900,
         ge=60,
         le=7 * 24 * 3600,
-        description="Lifetime in seconds of the presigned download/preview links the storage browser hands out",
+        description="Lifetime in seconds of the presigned download/preview links the storage browser hands out "
+        "(60 to 604800, i.e. 1 minute to 7 days)",
     )
     storage_upload_file_max_size: int = Field(
-        default=20 * 1024 * 1024,
+        default=DEFAULT_UPLOAD_MAX_BYTES,
         ge=1,
         description="Largest file the storage browser accepts in an upload: bytes, or a size such as 20MB, "
         "512KB or 1GB (binary units: 1MB = 1024 * 1024 bytes)",

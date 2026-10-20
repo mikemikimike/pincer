@@ -129,8 +129,10 @@ postgres = [
 # Skill roots in object storage: PINCER_SKILLS_DIR=s3://… / az://… / gs://…
 # cloudpathlib >= 0.25 refuses object keys that would map outside its local cache
 # dir; remote skills rely on that. azure-identity provides DefaultAzureCredential
-# for an account URL without an explicit credential.
-remote-skills = ["cloudpathlib[s3,azure,gs]>=0.25", "azure-identity>=1.15"]
+# for an account URL without an explicit credential. Capped below 0.27: the
+# storage browser lists folders through cloudpathlib's private `_list_dir`
+# (tests/test_storage_browser.py checks it is still there).
+remote-skills = ["cloudpathlib[s3,azure,gs]>=0.25,<0.27", "azure-identity>=1.15"]
 
 [project.scripts]
 pincer = "pincer.cli.main:app"

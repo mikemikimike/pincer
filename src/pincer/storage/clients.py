@@ -18,6 +18,7 @@ from pincer.exceptions import PincerError
 from pincer.tools.path_sandbox import SandboxDenied
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from cloudpathlib import CloudPath
@@ -55,9 +56,21 @@ def is_remote_uri(value: str | Path) -> bool:
     return isinstance(value, str) and bool(_REMOTE_URI_RE.match(value))
 
 
+def split_uri(uri: str) -> tuple[str, str]:
+    """(lower-cased scheme, the rest without surrounding slashes): `S3://b/k/` → `("s3", "b/k")`."""
+    scheme, _, rest = uri.partition("://")
+    return scheme.lower(), rest.strip("/")
+
+
 def uri_scheme(uri: str) -> str:
     """The lower-cased scheme of a URI: `S3://b/k` → `s3`."""
-    return uri.split("://", 1)[0].lower()
+    return split_uri(uri)[0]
+
+
+def bucket_root(uri: str) -> str:
+    """The bucket or container a cloud URI lives in, as a root: `s3://b/k` → `s3://b/`."""
+    scheme, rest = split_uri(uri)
+    return f"{scheme}://{rest.split('/', 1)[0]}/"
 
 
 def _secret(value: Any) -> str | None:
@@ -135,6 +148,44 @@ def build_client(scheme: str, settings: Settings, cache_dir: Path | None, file_c
         )
 
     raise UnsupportedStorageScheme(f"Unsupported storage scheme: {scheme}://")
+
+
+def open_cloud_uri(
+    uri: str,
+    settings: Settings,
+    cache_dir: Path | None,
+    *,
+    error: type[Exception],
+    what: str,
+    file_cache_mode: str | None = None,
+    build: Callable[[str, Settings, Path | None], Any] | None = None,
+) -> CloudPath:
+    """`uri` as a CloudPath, on a client built from the `storage_*` settings.
+
+    Every failure is raised as `error`, naming `what` is being opened (e.g.
+    "skills root"): a missing cloudpathlib with what to install, anything else
+    with what to configure for the scheme. SDK messages describe the failure
+    (a bad profile, a malformed connection string), never the secret values.
+    `build` stands in for `build_client`, for a caller that keeps a name of
+    its own to patch in tests.
+    """
+    scheme = uri_scheme(uri)
+    try:
+        import cloudpathlib  # noqa: F401
+    except ImportError as e:
+        raise error(
+            f"A cloud {what} ({uri}) needs cloudpathlib. Install it with: pip install 'pincer-agent[remote-skills]'"
+        ) from e
+    try:
+        if build is not None:
+            client = build(scheme, settings, cache_dir)
+        else:
+            client = build_client(scheme, settings, cache_dir, file_cache_mode=file_cache_mode)
+        return client.CloudPath(uri)  # type: ignore[no-any-return]
+    except error:
+        raise
+    except Exception as e:
+        raise error(f"Cannot open {what} {uri}: {type(e).__name__}: {e}. {STORAGE_HINTS.get(scheme, '')}") from e
 
 
 def confine_cloud_path(base: CloudPath, requested: str, label: str = "directory") -> CloudPath:

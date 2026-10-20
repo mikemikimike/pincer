@@ -1,9 +1,14 @@
-"""Tests for src/pincer/api/storage.py and src/pincer/storage/browser.py — the storage browser."""
+"""Tests for src/pincer/api/storage.py — the storage browser's HTTP routes.
+
+The browser itself (protection, moves, concurrent writes, the cloud SDK
+writes) is covered in test_storage_browser.py; root resolution and settings in
+test_storage_settings.py.
+"""
 
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,76 +19,54 @@ from fastapi.testclient import TestClient
 
 from pincer.api.auth import current_identity
 from pincer.api.server import create_app
+from pincer.api.storage import storage_browser
 from pincer.config import get_settings_relaxed
-from pincer.config.main import _RelaxedSettings
 from pincer.services.auth import AuthIdentity
-from pincer.storage import browser as storage_browser
-from pincer.storage.browser import StorageBrowser, resolve_storage_root
+from pincer.storage import browser as storage_browser_module
+from pincer.storage.browser import StorageBrowser
 
-# A dummy connection string: cloudpathlib's Azure mock refuses anonymous
-# clients but never connects anywhere.
-_FAKE_AZURE_CONNECTION_STRING = (
-    "DefaultEndpointsProtocol=https;AccountName=pincertest;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net"
-)
 _BUCKETS = {"s3": "s3://docs-bucket", "azure": "az://docs-container", "gs": "gs://docs-bucket"}
 
 
 @dataclass
 class Storage:
     client: TestClient
+    browser: StorageBrowser
     #: The storage root, for seeding and checking files behind the API.
     root: Any
     backend: str
 
 
-def _mock_client(backend: str, tmp_path: Path) -> Any:
-    local = pytest.importorskip("cloudpathlib.local")
-    from cloudpathlib.enums import FileCacheMode
-
-    kwargs: dict[str, Any] = {
-        "local_storage_dir": tmp_path / f"{backend}-storage",
-        "local_cache_dir": tmp_path / f"{backend}-cache",
-        "file_cache_mode": FileCacheMode.close_file,
-    }
-    if backend == "s3":
-        return local.LocalS3Client(**kwargs)
-    if backend == "azure":
-        return local.LocalAzureBlobClient(connection_string=_FAKE_AZURE_CONNECTION_STRING, **kwargs)
-    return local.LocalGSClient(**kwargs)
-
-
-@pytest.fixture(autouse=True)
-def _fresh_browser() -> Iterator[None]:
-    storage_browser.reset_storage_browser()
-    get_settings_relaxed.cache_clear()
-    yield
-    storage_browser.reset_storage_browser()
-    get_settings_relaxed.cache_clear()
-
-
 @pytest.fixture(params=["local", "s3", "azure", "gs"])
-def storage(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Storage]:
-    """The API over a storage root on every backend, with the skills dir at
-    `team/skills` under it. Local roots set PINCER_STORAGE_ROOT; cloud roots
-    leave it unset and fall back to the skills dir's bucket."""
+def storage(request: pytest.FixtureRequest, tmp_path: Path, mock_cloud_client: Callable[..., Any]) -> Iterator[Storage]:
+    """The API over a storage root on every backend, signed in as alice, with
+    the skills dir protected at `team/skills` under the root."""
     backend = request.param
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PINCER_DATA_DIR", str(tmp_path / "data"))
     if backend == "local":
-        root: Any = tmp_path / "root"
-        monkeypatch.setenv("PINCER_STORAGE_ROOT", str(root))
-        monkeypatch.setenv("PINCER_SKILLS_DIR", str(root / "team" / "skills"))
-        mock = None
+        root: Any = (tmp_path / "root").resolve()
+        root.mkdir()
     else:
-        mock = _mock_client(backend, tmp_path)
-        monkeypatch.delenv("PINCER_STORAGE_ROOT", raising=False)
-        monkeypatch.setenv("PINCER_SKILLS_DIR", f"{_BUCKETS[backend]}/team/skills")
-        root = mock.CloudPath(_BUCKETS[backend] + "/")
+        root = mock_cloud_client(backend, file_cache_mode="close_file").CloudPath(_BUCKETS[backend] + "/")
+    browser = StorageBrowser(root, ["team/skills"], 900, b"k" * 32)
 
     app = create_app()
+    app.dependency_overrides[storage_browser] = lambda: browser
     app.dependency_overrides[current_identity] = lambda: AuthIdentity("alice", "jwt")
-    with patch("pincer.storage.clients.build_client", return_value=mock):
-        yield Storage(TestClient(app), root, backend)
+    yield Storage(TestClient(app), browser, root, backend)
+
+
+@pytest.fixture
+def local_storage(storage: Storage) -> Storage:
+    if storage.backend != "local":
+        pytest.skip("local roots only")
+    return storage
+
+
+@pytest.fixture
+def cloud_storage(storage: Storage) -> Storage:
+    if storage.backend == "local":
+        pytest.skip("cloud roots only")
+    return storage
 
 
 def _write(root: Any, key: str, data: bytes | str) -> None:
@@ -138,7 +121,7 @@ def test_list_missing_folder_is_404(storage: Storage) -> None:
 
 
 def test_list_is_capped(storage: Storage, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(storage_browser, "MAX_LIST_ENTRIES", 2)
+    monkeypatch.setattr(storage_browser_module, "MAX_LIST_ENTRIES", 2)
     for name in ("a", "b", "c"):
         _write(storage.root, f"many/{name}.txt", name)
     body = storage.client.get("/api/storage/list", params={"prefix": "many"}).json()
@@ -240,12 +223,8 @@ def test_upload_conflict_and_overwrite(storage: Storage) -> None:
     assert (storage.root / "in" / "a.txt").read_text() == "new"
 
 
-def test_upload_over_the_size_limit_is_413_and_stores_nothing(
-    storage: Storage, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE", "1KB")
-    get_settings_relaxed.cache_clear()
-    storage_browser.reset_storage_browser()
+def test_upload_over_the_size_limit_is_413_and_stores_nothing(storage: Storage) -> None:
+    storage.browser.upload_max_bytes = 1024
     assert storage.client.get("/api/storage").json()["max_upload_bytes"] == 1024
 
     assert _upload(storage, "in", ("ok.bin", b"x" * 1024)).status_code == 200
@@ -255,45 +234,26 @@ def test_upload_over_the_size_limit_is_413_and_stores_nothing(
     assert not (storage.root / "in" / "big.bin").exists()
 
 
-def test_upload_limit_spools_unseekable_sources(tmp_path: Path) -> None:
-    class Pipe:
-        def __init__(self, data: bytes) -> None:
-            self._data = data
-
-        def seekable(self) -> bool:
-            return False
-
-        def read(self, size: int = -1) -> bytes:
-            chunk, self._data = self._data[:size], self._data[size:]
-            return chunk
-
-    root = (tmp_path / "root").resolve()
-    root.mkdir()
-    browser = StorageBrowser(root, [], 900, b"k" * 32, upload_max_bytes=10)
-    browser.upload("", "small.bin", Pipe(b"0123456789"))  # type: ignore[arg-type]
-    assert (root / "small.bin").read_bytes() == b"0123456789"
-    with pytest.raises(storage_browser.TooLarge):
-        browser.upload("", "big.bin", Pipe(b"0123456789A"))  # type: ignore[arg-type]
-    assert not (root / "big.bin").exists()
-
-
-def test_upload_limit_defaults_to_20mb() -> None:
-    assert _RelaxedSettings().storage_upload_file_max_size == 20 * 1024 * 1024  # type: ignore[call-arg]
-
-
 @pytest.mark.parametrize(
-    ("raw", "expected"),
-    [("20MB", 20 * 1024**2), ("20Mb", 20 * 1024**2), ("512 kb", 512 * 1024), ("1G", 1024**3), ("2048", 2048)],
+    ("files", "status"),
+    [
+        ([("first.txt", b"1"), ("exists.txt", b"2")], 409),
+        ([("first.txt", b"1"), ("big.bin", b"x" * 1025)], 413),
+        ([("first.txt", b"1"), ("first.txt", b"1 again")], 409),
+        ([("first.txt", b"1"), ("../escape.txt", b"2")], 400),
+    ],
+    ids=["exists", "too-large", "twice", "bad-name"],
 )
-def test_upload_limit_setting_accepts_sizes(raw: str, expected: int) -> None:
-    assert _RelaxedSettings(storage_upload_file_max_size=raw).storage_upload_file_max_size == expected  # type: ignore[call-arg]
-
-
-def test_upload_limit_setting_rejects_nonsense() -> None:
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        _RelaxedSettings(storage_upload_file_max_size="lots")  # type: ignore[call-arg]
+def test_upload_refused_late_in_the_request_stores_nothing(
+    storage: Storage, files: list[tuple[str, bytes]], status: int
+) -> None:
+    """Every file is checked before any is written, so a refusal of a later
+    file does not leave the earlier ones stored."""
+    storage.browser.upload_max_bytes = 1024
+    _write(storage.root, "in/exists.txt", "old")
+    assert _upload(storage, "in", *files).status_code == status
+    assert not (storage.root / "in" / "first.txt").exists()
+    assert (storage.root / "in" / "exists.txt").read_text() == "old"
 
 
 def test_upload_refuses_traversing_filename(storage: Storage) -> None:
@@ -343,13 +303,19 @@ def test_save_with_etag_of_deleted_file_conflicts(storage: Storage) -> None:
     assert res.status_code == 409
 
 
+def test_save_with_a_non_ascii_etag_is_a_conflict_not_an_error(storage: Storage) -> None:
+    _write(storage.root, "notes/a.md", "# one")
+    res = storage.client.put("/api/storage/text", json={"key": "notes/a.md", "content": "x", "etag": "é"})
+    assert res.status_code == 409
+
+
 def test_read_text_rejects_binary_and_large(storage: Storage, monkeypatch: pytest.MonkeyPatch) -> None:
     _write(storage.root, "bin.dat", b"\x00\xff\xfe")
     _write(storage.root, "latin1.txt", "café".encode("latin-1"))
     assert storage.client.get("/api/storage/text", params={"key": "bin.dat"}).status_code == 415
     assert storage.client.get("/api/storage/text", params={"key": "latin1.txt"}).status_code == 415
 
-    monkeypatch.setattr(storage_browser, "MAX_TEXT_BYTES", 4)
+    monkeypatch.setattr(storage_browser_module, "MAX_TEXT_BYTES", 4)
     _write(storage.root, "big.txt", "12345")
     assert storage.client.get("/api/storage/text", params={"key": "big.txt"}).status_code == 413
     too_big = storage.client.put("/api/storage/text", json={"key": "big2.txt", "content": "12345"})
@@ -398,6 +364,17 @@ def test_move_folder(storage: Storage) -> None:
     assert into_itself.status_code == 400
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_move_onto_a_folder_that_contains_the_source_is_refused(storage: Storage, overwrite: bool) -> None:
+    """Replacing `a` with `a/b` would delete `a/b` itself and its siblings."""
+    _write(storage.root, "a/b/x.txt", "x")
+    _write(storage.root, "a/c.txt", "c")
+    res = storage.client.post("/api/storage/move", json={"from": "a/b", "to": "a", "overwrite": overwrite})
+    assert res.status_code == 409
+    assert (storage.root / "a" / "b" / "x.txt").read_text() == "x"
+    assert (storage.root / "a" / "c.txt").read_text() == "c"
+
+
 def test_delete_file_and_folder(storage: Storage) -> None:
     _write(storage.root, "docs/a.txt", "a")
     _write(storage.root, "docs/sub/b.txt", "b")
@@ -432,16 +409,6 @@ def test_traversal_is_rejected(storage: Storage, key: str) -> None:
     assert client.post("/api/storage/move", json={"from": "a", "to": key}).status_code == 400
 
 
-def test_local_symlink_out_of_root_is_rejected(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    (tmp_path / "secret.txt").write_text("s")
-    (root / "link.txt").symlink_to(tmp_path / "secret.txt")
-    browser = StorageBrowser(root.resolve(), [], 900, b"k" * 32)
-    with pytest.raises(storage_browser.InvalidKey):
-        browser.read_text("link.txt")
-
-
 # ── Protected skills prefix ──────────────────────────────────────────────────
 
 
@@ -460,16 +427,18 @@ def test_protected_file_cannot_be_deleted_or_moved(storage: Storage) -> None:
     assert storage.client.delete("/api/storage/object", params={"key": key}).status_code == 403
     assert storage.client.post("/api/storage/move", json={"from": key, "to": "x.md"}).status_code == 403
     assert storage.client.post("/api/storage/move", json={"from": "team", "to": "t2"}).status_code == 403
-    # Nor can something be moved over or into it.
+    # Nor can something be moved over or into it: the skills dir changes only
+    # through upload and the editor.
     into = storage.client.post("/api/storage/move", json={"from": "other.txt", "to": "team/skills/o.txt"})
     assert into.status_code == 403
     assert (storage.root / key).exists()
 
 
-def test_protected_files_can_still_be_edited(storage: Storage) -> None:
+def test_protected_files_can_still_be_uploaded_and_edited(storage: Storage) -> None:
     _write(storage.root, "team/skills/demo/SKILL.md", "x")
     res = storage.client.put("/api/storage/text", json={"key": "team/skills/demo/SKILL.md", "content": "y"})
     assert res.status_code == 200
+    assert _upload(storage, "team/skills/demo", ("notes.md", b"n")).status_code == 200
 
 
 def test_sibling_with_common_name_prefix_is_not_protected(storage: Storage) -> None:
@@ -480,53 +449,19 @@ def test_sibling_with_common_name_prefix_is_not_protected(storage: Storage) -> N
 # ── Presigned links ──────────────────────────────────────────────────────────
 
 
-def test_presign_cloud_uses_provider_url_with_ttl(storage: Storage) -> None:
-    if storage.backend == "local":
-        pytest.skip("cloud roots only")
-    _write(storage.root, "img/p.png", b"png")
+def test_presign_cloud_uses_provider_url_with_ttl(cloud_storage: Storage) -> None:
+    _write(cloud_storage.root, "img/p.png", b"png")
     with patch(
         "cloudpathlib.CloudPath.as_url", return_value="https://signed.example/p.png?X-Amz-Expires=900"
     ) as as_url:
-        res = storage.client.get("/api/storage/presign", params={"key": "img/p.png", "disposition": "inline"})
+        res = cloud_storage.client.get("/api/storage/presign", params={"key": "img/p.png", "disposition": "inline"})
     assert res.status_code == 200
     assert res.json()["url"] == "https://signed.example/p.png?X-Amz-Expires=900"
     as_url.assert_called_once_with(presign=True, expire_seconds=900)
 
 
-def test_presign_s3_signs_v4_with_response_disposition(tmp_path: Path) -> None:
-    from urllib.parse import parse_qs, urlsplit
-
-    # A real S3Client: building it and presigning are both offline.
-    settings = _settings(
-        tmp_path,
-        storage_s3_endpoint_url="http://s3.example.test:9000",
-        storage_s3_region="eu-central-1",
-        storage_s3_access_key_id="AKIATEST",
-        storage_s3_secret_access_key="secret",
-    )
-    browser = StorageBrowser(object(), [], 900, b"k" * 32)  # type: ignore[arg-type]
-    client = storage_browser.clients.build_client("s3", settings, tmp_path / "cache")
-    url = browser._presign_cloud(client.CloudPath("s3://b/dir/r é.pdf"), "attachment")
-
-    parts = urlsplit(url)
-    query = parse_qs(parts.query)
-    assert parts.netloc == "s3.example.test:9000"
-    assert query["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
-    assert query["X-Amz-Expires"] == ["900"]
-    assert query["response-content-disposition"] == ["attachment; filename*=UTF-8''r%20%C3%A9.pdf"]
-    assert query["response-content-type"] == ["application/pdf"]
-    assert "eu-central-1" in query["X-Amz-Credential"][0]
-
-
 def test_presign_missing_file_is_404(storage: Storage) -> None:
     assert storage.client.get("/api/storage/presign", params={"key": "nope.png"}).status_code == 404
-
-
-@pytest.fixture
-def local_storage(storage: Storage) -> Storage:
-    if storage.backend != "local":
-        pytest.skip("local roots only")
-    return storage
 
 
 def test_presign_local_round_trip(local_storage: Storage) -> None:
@@ -547,8 +482,10 @@ def test_presign_local_tampered_and_expired_tokens(local_storage: Storage) -> No
     payload, signature = url.rsplit("/", 1)[1].split(".")
     assert local_storage.client.get(f"/api/storage/signed/{payload}.{signature[:-2]}xx").status_code == 403
     assert local_storage.client.get("/api/storage/signed/garbage").status_code == 403
+    # A non-ASCII signature is refused like any wrong one, not a 503.
+    assert local_storage.client.get("/api/storage/signed/abc.%C3%A9").status_code == 403
 
-    browser = storage_browser.get_storage_browser(get_settings_relaxed())
+    browser = local_storage.browser
     expired = browser.sign("a.txt", int(time.time()) - 1, "attachment")
     assert local_storage.client.get(f"/api/storage/signed/{expired}").status_code == 410
     # A validly signed key is still confined to the root.
@@ -556,18 +493,16 @@ def test_presign_local_tampered_and_expired_tokens(local_storage: Storage) -> No
     assert local_storage.client.get(f"/api/storage/signed/{escape}").status_code == 400
 
 
-def test_signed_route_is_404_for_cloud_roots(storage: Storage) -> None:
-    if storage.backend == "local":
-        pytest.skip("cloud roots only")
-    browser = storage_browser.get_storage_browser(get_settings_relaxed())
-    token = browser.sign("a.txt", int(time.time()) + 60, "inline")
-    assert storage.client.get(f"/api/storage/signed/{token}").status_code == 404
+def test_signed_route_is_404_for_cloud_roots(cloud_storage: Storage) -> None:
+    token = cloud_storage.browser.sign("a.txt", int(time.time()) + 60, "inline")
+    assert cloud_storage.client.get(f"/api/storage/signed/{token}").status_code == 404
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
 
 def test_storage_requires_authentication(authed_app: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Through the real dependency: the root comes from the settings."""
     monkeypatch.setenv("PINCER_STORAGE_ROOT", str(tmp_path / "root"))
     get_settings_relaxed.cache_clear()
     client = authed_app.client
@@ -585,75 +520,49 @@ def test_storage_requires_authentication(authed_app: Any, monkeypatch: pytest.Mo
     assert client.get("/api/storage/signed/forged.token").status_code == 403
 
 
-def test_mutations_need_an_identity_even_with_auth_disabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("PINCER_DATA_DIR", str(tmp_path))
+def test_an_api_key_can_read_but_not_change_files(
+    authed_app: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A long-lived, often embedded API key must not be able to overwrite or
+    delete every file under the root: changes need a signed-in session."""
     monkeypatch.setenv("PINCER_STORAGE_ROOT", str(tmp_path / "root"))
-    client = TestClient(create_app())
+    get_settings_relaxed.cache_clear()
+    (tmp_path / "root").mkdir()
+    (tmp_path / "root" / "f.txt").write_text("f")
+    client = authed_app.client
+    headers = {"Authorization": f"Bearer {authed_app.api_key}"}
+
+    assert client.get("/api/storage/list", headers=headers).status_code == 200
+    assert client.get("/api/storage/text", params={"key": "f.txt"}, headers=headers).status_code == 200
+    changes = [
+        client.put("/api/storage/text", json={"key": "f.txt", "content": "x"}, headers=headers),
+        client.post("/api/storage/upload", files=[("files", ("u.txt", b"u"))], headers=headers),
+        client.post("/api/storage/folders", json={"prefix": "x"}, headers=headers),
+        client.post("/api/storage/move", json={"from": "f.txt", "to": "g.txt"}, headers=headers),
+        client.delete("/api/storage/object", params={"key": "f.txt"}, headers=headers),
+    ]
+    assert [res.status_code for res in changes] == [403] * 5
+    assert (tmp_path / "root" / "f.txt").read_text() == "f"
+
+
+def test_mutations_need_an_identity_even_with_auth_disabled(tmp_path: Path) -> None:
+    root = (tmp_path / "root").resolve()
+    root.mkdir()
+    app = create_app()
+    app.dependency_overrides[storage_browser] = lambda: StorageBrowser(root, [], 900, b"k" * 32)
+    client = TestClient(app)
     assert client.get("/api/storage/list").status_code == 200
     assert client.post("/api/storage/folders", json={"prefix": "x"}).status_code == 401
 
 
-# ── Root resolution ──────────────────────────────────────────────────────────
-
-
-def _settings(tmp_path: Path, **overrides: object) -> _RelaxedSettings:
-    return _RelaxedSettings(data_dir=tmp_path, **overrides)  # type: ignore[arg-type]
-
-
-def test_root_falls_back_to_cloud_skills_bucket(tmp_path: Path) -> None:
-    mock = _mock_client("s3", tmp_path)
-    settings = _settings(tmp_path, skills_dir="s3://acme/teams/skills/")
-    with patch("pincer.storage.clients.build_client", return_value=mock) as build:
-        root, protected = resolve_storage_root(settings)
-    assert str(root).rstrip("/") == "s3://acme"
-    assert protected == ["teams/skills"]
-    assert build.call_args.args[0] == "s3"
-
-
-def test_root_is_the_whole_bucket_when_skills_sit_at_its_top(tmp_path: Path) -> None:
-    mock = _mock_client("gs", tmp_path)
-    with patch("pincer.storage.clients.build_client", return_value=mock):
-        _root, protected = resolve_storage_root(_settings(tmp_path, skills_dir="gs://acme"))
-    assert protected == [""]
-    browser = StorageBrowser(_root, protected, 900, b"k" * 32)
-    assert browser.is_protected("anything")
-
-
-def test_root_defaults_to_data_dir_storage_for_local_skills(tmp_path: Path) -> None:
-    root, protected = resolve_storage_root(_settings(tmp_path, skills_dir=tmp_path / "skills"))
-    assert root == (tmp_path / "storage").resolve()
-    assert root.is_dir()
-    assert protected == []
-
-
-def test_explicit_root_protects_skills_inside_it(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, storage_root=str(tmp_path / "files"), skills_dir=tmp_path / "files" / "skills")
-    root, protected = resolve_storage_root(settings)
-    assert root == (tmp_path / "files").resolve()
-    assert protected == ["skills"]
-
-    outside = _settings(tmp_path, storage_root=str(tmp_path / "files"), skills_dir="s3://acme/skills")
-    assert resolve_storage_root(outside)[1] == []
-
-
-def test_explicit_cloud_root_protects_skills_under_it(tmp_path: Path) -> None:
-    mock = _mock_client("azure", tmp_path)
-    settings = _settings(tmp_path, storage_root="az://box/shared", skills_dir="az://box/shared/agents/skills")
-    with patch("pincer.storage.clients.build_client", return_value=mock):
-        _root, protected = resolve_storage_root(settings)
-    assert protected == ["agents/skills"]
-
-
-def test_storage_root_setting_keeps_uris() -> None:
-    assert _RelaxedSettings(storage_root="s3://bucket/x").storage_root == "s3://bucket/x"  # type: ignore[call-arg]
-    assert _RelaxedSettings(storage_root="").storage_root is None  # type: ignore[call-arg]
-
-
-def test_is_protected_covers_ancestors_and_descendants() -> None:
-    browser = StorageBrowser(Path("/r"), ["a/b"], 900, b"k" * 32)
-    assert browser.is_protected("a/b")
-    assert browser.is_protected("a/b/c.txt")
-    assert browser.is_protected("a")
-    assert browser.is_protected("")
-    assert not browser.is_protected("a/bc")
-    assert not browser.is_protected("x/a/b")
+def test_an_unusable_root_is_503(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A root the browser refuses to serve fails every route, with the reason."""
+    monkeypatch.setenv("PINCER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("PINCER_STORAGE_ROOT", str(tmp_path))
+    get_settings_relaxed.cache_clear()
+    try:
+        res = TestClient(create_app()).get("/api/storage/list")
+    finally:
+        get_settings_relaxed.cache_clear()
+    assert res.status_code == 503
+    assert "contains the data dir" in res.json()["detail"]

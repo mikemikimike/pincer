@@ -426,20 +426,20 @@ List the agent's built-in tools, configured Google Workspace / Slack integration
 
 ## Storage
 
-Browse and manage files under the **storage root**: `PINCER_STORAGE_ROOT` (a local path or an `s3://` / `az://` / `gs://` URI). When it is unset and `skills_dir` is a cloud URI, the root is that bucket or container; otherwise it is `<data_dir>/storage`. Cloud roots use the same `PINCER_STORAGE_*` credentials as remote skill roots.
+Browse and manage files under the **storage root**: `PINCER_STORAGE_ROOT` (a local path or an `s3://` / `az://` / `gs://` URI). When it is unset and `skills_dir` is a cloud URI, the root is that bucket or container; otherwise it is `<data_dir>/storage`. Cloud roots use the same `PINCER_STORAGE_*` credentials as remote skill roots. A local root that contains the data dir (`PINCER_STORAGE_ROOT=/app` with the data dir in `/app/data`) is refused with `503` on every route, since the data dir holds the JWT secret and the database; `pincer doctor` flags it too.
 
 Keys are POSIX paths relative to the root (`reports/q1.pdf`; `""` is the root). Absolute keys, `~`, `..` segments and scheme-qualified keys are refused with `400`.
 
-**Protected prefixes.** When the skills dir lies under the root, its prefix is protected: deleting or moving it, anything inside it, or any of its parent folders is a `403`. Files inside it can still be read, uploaded and edited.
+**Protected prefixes.** When the skills dir lies under the root, its prefix is protected: deleting or moving it, anything inside it, or any of its parent folders is a `403`, and so is moving something into it. Files inside it can still be read, uploaded and edited. On a local root the check follows the folder on disk, not the key: a different-case key on a case-insensitive filesystem, a Unicode variant of a name, or a symlink leading into the skills dir is refused the same way. A symlink that points into it can itself be deleted or moved; that leaves the skills dir alone.
 
-Every route needs a bearer token, except `/api/storage/signed/{token}`. The routes that change something (`PUT /text`, `POST /upload`, `POST /folders`, `POST /move`, `DELETE /object`) also need a signed-in identity when `PINCER_AUTH_DISABLED` is set.
+Every route needs a bearer token, except `/api/storage/signed/{token}`. Reading needs any authenticated identity. The routes that change something (`PUT /text`, `POST /upload`, `POST /folders`, `POST /move`, `DELETE /object`) need a signed-in session: an API key gets `403` there, and with `PINCER_AUTH_DISABLED` a request without an identity gets `401`.
 
 | Status | Meaning |
 |---|---|
 | `400` | Invalid key (traversal, absolute path, scheme), or a folder moved into itself |
-| `403` | Protected prefix, or an invalid signed link |
+| `403` | Protected prefix, an API key on a route that changes files, or an invalid signed link |
 | `404` | No such file or folder |
-| `409` | Already exists (upload, move, mkdir without `overwrite`), or the file changed since it was read (`PUT /text` with a stale `etag`) |
+| `409` | Already exists (upload, move, mkdir without `overwrite`), the same name twice in one upload, a move onto a folder that contains the source, or the file changed since it was read (`PUT /text` with a stale `etag`) |
 | `410` | The signed link has expired |
 | `413` | Text larger than 2 MB, or an upload larger than `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` |
 | `415` | Not a UTF-8 text file |
@@ -475,13 +475,13 @@ A folder with more than 100,000 entries can only be paged through up to that poi
 
 ### `GET /api/storage/presign?key=…&disposition=inline|attachment`
 
-A link that serves the file without a bearer token, valid for `PINCER_STORAGE_PRESIGN_TTL` seconds (default 900), for `<img src>`, downloads and "open in new tab".
+A link that serves the file without a bearer token, valid for `PINCER_STORAGE_PRESIGN_TTL` seconds (default 900; 60 to 604800, i.e. 1 minute to 7 days), for `<img src>`, downloads and "open in new tab".
 
 ```json
 {"url": "https://acme.s3.amazonaws.com/reports/q1.pdf?X-Amz-Expires=900&…", "expires_at": "2026-10-18T16:23:36+00:00"}
 ```
 
-Cloud roots return the provider's presigned URL; S3 links also carry the requested `Content-Disposition`. Local roots return a path on this API, `/api/storage/signed/<token>`, which the client resolves against the API's base URL.
+Cloud roots return the provider's presigned URL; S3 links also carry the requested `Content-Disposition`, except that HTML, SVG and XML files always download (`attachment`): the provider serves them without the headers below, from the bucket's origin. Azure and GCS links are served with the content type the object was stored with. Local roots return a path on this API, `/api/storage/signed/<token>`, which the client resolves against the API's base URL.
 
 ### `GET /api/storage/signed/{token}`
 
@@ -491,7 +491,7 @@ Public. Serves a file of a **local** root from a link minted by `/presign`. The 
 
 The file as an attachment, with the bearer token. A fallback for clients that cannot use `/presign`.
 
-Served files (here and through signed links) carry `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`, so an uploaded HTML or SVG file cannot run script on the API's origin.
+Files served by this API (here and through `/signed/` links) carry `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`, so an uploaded HTML or SVG file cannot run script on the API's origin. A cloud root's presigned links are served by the provider instead; see `/presign`.
 
 ### `GET /api/storage/text?key=…`
 
@@ -509,9 +509,13 @@ A UTF-8 text file of at most 2 MB, for the editor. The `etag` is a hash of the c
 
 Saves the file and returns `{"key", "etag", "size"}`. With `etag`, the save is refused with `409` if the file changed (or was deleted) since it was read. Omit `etag` to overwrite unconditionally, or to create a new file.
 
+Two saves with the same `etag` cannot both succeed. On S3, Azure and GCS the write is conditional on the version that was checked (`If-Match` / generation match), so this holds across replicas. On a local root, saves of one file are serialised within the Pincer process. An S3-compatible server that rejects conditional writes (`501 NotImplemented`) is logged once and from then on written without them, so its saves are serialised within the process only; a server that silently ignores the headers gets no protection across replicas either.
+
 ### `POST /api/storage/upload?prefix=…&overwrite=false`
 
-Multipart form with one or more `files` parts. A file name may carry subfolders (`2026/q1.pdf`, from a folder pick); they are created. Each file may be at most `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` (default 20 MB), else `413`, and nothing of it is stored. An existing file is a `409` unless `overwrite=true`. Either way, files earlier in the same request are already stored. Returns `{"files": [<file entry>, …]}`.
+Multipart form with one or more `files` parts. A file name may carry subfolders (`2026/q1.pdf`, from a folder pick); they are created. Returns `{"files": [<file entry>, …]}`.
+
+Every file is checked before any is written, so a refusal stores none of them: a bad name (`400`), an existing file without `overwrite=true` or the same name twice (`409`), or a file over `PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE` (default 20 MB; `413`). Without `overwrite`, the write itself only creates: a file someone else stores under the same name in the meantime is a `409`, not overwritten. Only a failure while writing (that `409`, or an unavailable store) can leave earlier files of the request stored; the error's detail then names them.
 
 ### `POST /api/storage/folders`
 
@@ -519,7 +523,7 @@ Multipart form with one or more `files` parts. A file name may carry subfolders 
 
 ### `POST /api/storage/move`
 
-`{"from": "reports/q1.pdf", "to": "archive/q1.pdf", "overwrite": false}` moves or renames a file or a folder. Object stores copy and then delete, object by object. `409` if the target exists and `overwrite` is `false`; `403` if either side is protected.
+`{"from": "reports/q1.pdf", "to": "archive/q1.pdf", "overwrite": false}` moves or renames a file or a folder. Object stores copy and then delete, object by object. `409` if the target exists and `overwrite` is `false`, or if the target is a folder that contains the source (replacing `a` with `a/b` would delete `a/b` too); `403` if either side is protected. On a case-insensitive disk, a rename that only changes case (`readme.md` → `README.md`) is a rename, with or without `overwrite`.
 
 ### `DELETE /api/storage/object?key=…` / `?prefix=…`
 

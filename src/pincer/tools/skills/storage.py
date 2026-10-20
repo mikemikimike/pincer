@@ -23,8 +23,6 @@ from typing import TYPE_CHECKING, Any
 
 from pincer.exceptions import SkillLoadError
 from pincer.storage import clients
-from pincer.storage.clients import STORAGE_HINTS as _STORAGE_HINTS
-from pincer.storage.clients import is_remote_uri as is_remote_uri
 from pincer.tools.path_sandbox import confine_path
 
 if TYPE_CHECKING:
@@ -35,10 +33,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 type SkillPath = Path | CloudPath
-
-_MISSING_EXTRA_MSG = (
-    "Remote skill roots ({uri}) need cloudpathlib. Install it with: pip install 'pincer-agent[remote-skills]'"
-)
 
 
 def _build_client(scheme: str, settings: Settings, cache_dir: Path | None) -> Any:
@@ -56,28 +50,18 @@ def open_skills_root(location: str | Path, settings: Settings) -> SkillPath:
     `skills_*` credential settings (never the cloudpathlib global default
     client), with the SDK's default credential chain covering anything unset.
     """
-    if isinstance(location, Path) or not is_remote_uri(location):
+    if isinstance(location, Path) or not clients.is_remote_uri(location):
         return Path(location).expanduser()
 
-    uri = location
-    scheme = uri.split("://", 1)[0].lower()
-    try:
-        import cloudpathlib  # noqa: F401
-    except ImportError as e:
-        raise SkillLoadError(_MISSING_EXTRA_MSG.format(uri=uri)) from e
-
     cache_root = settings.skills_cache_dir
-    try:
-        client = _build_client(scheme, settings, cache_root / "objects" if cache_root else None)
-        return client.CloudPath(uri)  # type: ignore[no-any-return]
-    except SkillLoadError:
-        raise
-    except Exception as e:
-        # SDK messages describe the failure (bad profile, malformed connection
-        # string), never the secret values themselves.
-        raise SkillLoadError(
-            f"Cannot open skills root {uri}: {type(e).__name__}: {e}. {_STORAGE_HINTS.get(scheme, '')}"
-        ) from e
+    return clients.open_cloud_uri(
+        location,
+        settings,
+        cache_root / "objects" if cache_root else None,
+        error=SkillLoadError,
+        what="skills root",
+        build=_build_client,
+    )
 
 
 def open_usable_skills_root(location: str | Path, settings: Settings) -> SkillPath:
@@ -93,7 +77,7 @@ def open_usable_skills_root(location: str | Path, settings: Settings) -> SkillPa
     if isinstance(root, Path):
         return root
     uri = str(location)
-    hint = _STORAGE_HINTS.get(uri.split("://", 1)[0].lower(), "")
+    hint = clients.STORAGE_HINTS.get(clients.uri_scheme(uri), "")
     try:
         next(iter(root.iterdir()), None)
     except Exception as e:

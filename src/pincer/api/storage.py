@@ -9,37 +9,32 @@ Downloads and previews go through presigned links (`/presign`): the browser
 can then use them in `<img src>` or a plain navigation, which cannot carry a
 bearer token. A cloud root signs with the provider; a local root signs with
 the JWT secret and serves the file from the public `/signed/{token}` route.
+
+Reading needs any authenticated identity; changing files needs a signed-in
+session, not an API key (see `InteractiveIdentity`).
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import functools
 import logging
 from collections.abc import Callable, Iterator
 from typing import IO, Annotated, Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 from starlette.responses import Response
 
-from pincer.api.auth import CurrentIdentity
-from pincer.storage.browser import (
-    DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE,
-    MAX_TEXT_BYTES,
-    Disposition,
-    Download,
-    KeyNotFound,
-    StorageBrowser,
-    StorageError,
-    get_storage_browser,
-)
+from pincer.api.auth import InteractiveIdentity
+from pincer.config import get_settings_relaxed
+from pincer.storage.browser import Download, StorageBrowser, get_storage_browser
 from pincer.storage.clients import STORAGE_HINTS
+from pincer.storage.errors import KeyNotFound, StorageError
+from pincer.storage.limits import COPY_CHUNK, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_TEXT_BYTES
+from pincer.storage.signing import Disposition
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +45,6 @@ _SAFE_FILE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'",
 }
-_CHUNK = 1024 * 1024
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -143,35 +137,40 @@ class DeletedOut(BaseModel):
 # ── Plumbing ─────────────────────────────────────────────────────────────────
 
 
-def _browser() -> StorageBrowser:
-    from pincer.config import get_settings_relaxed
+def _http_error(e: Exception, scheme: str) -> HTTPException:
+    """The HTTP error a failed storage operation answers with."""
+    if isinstance(e, StorageError):
+        return HTTPException(status_code=e.status, detail=str(e))
+    if isinstance(e, FileNotFoundError):
+        return HTTPException(status_code=404, detail="Not found")
+    if isinstance(e, FileExistsError | IsADirectoryError | NotADirectoryError):
+        return HTTPException(status_code=409, detail=f"Conflicts with an existing file or folder: {e}")
+    # SDK errors: credentials, a missing bucket, an unreachable endpoint.
+    logger.error("Storage operation failed", exc_info=e)
+    hint = STORAGE_HINTS.get(scheme, "")
+    return HTTPException(status_code=503, detail=f"Storage unavailable: {type(e).__name__}: {e}. {hint}".strip())
 
-    return get_storage_browser(get_settings_relaxed())
 
-
-async def _run[T](op: Callable[[StorageBrowser], T]) -> T:
-    """Run a blocking storage operation in a worker thread, mapping failures to HTTP errors."""
-
-    def call() -> T:
-        return op(_browser())
-
+def storage_browser() -> StorageBrowser:
+    """The browser for the current settings. A dependency, so tests can swap it
+    through `app.dependency_overrides`; FastAPI runs it in a worker thread,
+    since building a cloud client blocks."""
+    settings = get_settings_relaxed()
     try:
-        return await asyncio.to_thread(call)
-    except StorageError as e:
-        raise HTTPException(status_code=e.status, detail=str(e)) from e
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail="Not found") from e
-    except (FileExistsError, IsADirectoryError, NotADirectoryError) as e:
-        raise HTTPException(status_code=409, detail=f"Conflicts with an existing file or folder: {e}") from e
+        return get_storage_browser(settings)
     except Exception as e:
-        # SDK errors: credentials, a missing bucket, an unreachable endpoint.
-        logger.exception("Storage operation failed")
-        hint = ""
-        with contextlib.suppress(Exception):
-            hint = STORAGE_HINTS.get(_browser().scheme, "")
-        raise HTTPException(
-            status_code=503, detail=f"Storage unavailable: {type(e).__name__}: {e}. {hint}".strip()
-        ) from e
+        raise _http_error(e, "") from e
+
+
+StorageBrowserDep = Annotated[StorageBrowser, Depends(storage_browser)]
+
+
+async def _run[T](browser: StorageBrowser, op: Callable[[StorageBrowser], T]) -> T:
+    """Run a blocking storage operation in a worker thread, mapping failures to HTTP errors."""
+    try:
+        return await asyncio.to_thread(op, browser)
+    except Exception as e:
+        raise _http_error(e, browser.scheme) from e
 
 
 def _content_disposition(disposition: Disposition, name: str) -> str:
@@ -180,7 +179,7 @@ def _content_disposition(disposition: Disposition, name: str) -> str:
 
 def _iter_stream(stream: IO[bytes]) -> Iterator[bytes]:
     try:
-        while chunk := stream.read(_CHUNK):
+        while chunk := stream.read(COPY_CHUNK):
             yield chunk
     finally:
         stream.close()
@@ -205,38 +204,40 @@ def _send(download: Download, disposition: Disposition) -> Response:
 
 
 @router.get("", response_model=StorageInfoOut)
-async def storage_info() -> dict[str, object]:
+async def storage_info(browser: StorageBrowserDep) -> dict[str, object]:
     """The storage backend, its root, the protected prefixes and the presign TTL."""
-    return await _run(lambda b: b.info())
+    return await _run(browser, lambda b: b.info())
 
 
 @router.get("/list", response_model=ListingOut)
 async def list_folder(
+    browser: StorageBrowserDep,
     prefix: str = Query("", description="Folder key; empty for the root"),
     cursor: str | None = Query(None, description="`next_cursor` of the previous page"),
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Entries per page"),
 ) -> dict[str, object]:
     """One page of the folders and files directly inside `prefix`: folders first, then files, by name."""
-    return await _run(lambda b: b.list_dir(prefix, cursor=cursor, limit=limit))
+    return await _run(browser, lambda b: b.list_dir(prefix, cursor=cursor, limit=limit))
 
 
 @router.get("/download")
-async def download(key: str = Query(..., min_length=1)) -> Response:
+async def download(browser: StorageBrowserDep, key: str = Query(..., min_length=1)) -> Response:
     """Download a file with the bearer token (fallback for clients that cannot use `/presign`)."""
-    return _send(await _run(lambda b: b.open_read(key)), "attachment")
+    return _send(await _run(browser, lambda b: b.open_read(key)), "attachment")
 
 
 @router.get("/presign", response_model=PresignOut)
 async def presign(
+    browser: StorageBrowserDep,
     key: str = Query(..., min_length=1),
     disposition: Annotated[Disposition, Query()] = "attachment",
 ) -> dict[str, object]:
     """A link to `key` that needs no bearer token, valid for `presign_ttl` seconds."""
-    return await _run(lambda b: b.presign(key, disposition))
+    return await _run(browser, lambda b: b.presign(key, disposition))
 
 
 @router.get("/signed/{token}")
-async def signed(token: str) -> Response:
+async def signed(token: str, browser: StorageBrowserDep) -> Response:
     """Serve a file from a local root through a link minted by `/presign`.
 
     Public: the token is the credential (HMAC over key, expiry and disposition).
@@ -248,64 +249,61 @@ async def signed(token: str) -> Response:
         key, disposition = b.verify(token)
         return b.open_read(key), disposition
 
-    download_, disposition = await _run(open_signed)
+    download_, disposition = await _run(browser, open_signed)
     return _send(download_, disposition)
 
 
 @router.get("/text", response_model=TextOut)
-async def read_text(key: str = Query(..., min_length=1)) -> dict[str, object]:
+async def read_text(browser: StorageBrowserDep, key: str = Query(..., min_length=1)) -> dict[str, object]:
     """A UTF-8 text file (up to 2 MB) and its etag, for the editor."""
-    return await _run(lambda b: b.read_text(key))
+    return await _run(browser, lambda b: b.read_text(key))
 
 
 @router.put("/text", response_model=TextSavedOut)
-async def save_text(body: TextIn, identity: CurrentIdentity) -> dict[str, object]:
+async def save_text(body: TextIn, identity: InteractiveIdentity, browser: StorageBrowserDep) -> dict[str, object]:
     """Save a text file. With `etag`, 409 if it changed on the server since it was read."""
-    result = await _run(lambda b: b.write_text(body.key, body.content, body.etag))
+    result = await _run(browser, lambda b: b.write_text(body.key, body.content, body.etag))
     logger.info("Storage: %s saved %s", identity.pincer_user_id, body.key)
     return result
 
 
-def _store_upload(b: StorageBrowser, *, file: UploadFile, prefix: str, overwrite: bool) -> dict[str, object]:
-    return b.upload(prefix, file.filename or "", file.file, overwrite=overwrite)
-
-
 @router.post("/upload", response_model=UploadOut)
 async def upload(
-    identity: CurrentIdentity,
+    identity: InteractiveIdentity,
+    browser: StorageBrowserDep,
     files: Annotated[list[UploadFile], File(description="Files to store; a name may carry subfolders")],
     prefix: str = Query("", description="Folder to upload into"),
     overwrite: bool = Query(False, description="Replace files that already exist (else 409)"),
 ) -> dict[str, object]:
-    """Upload files into `prefix`. Stops at the first file that already exists unless `overwrite`,
-    or that is larger than PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE (413)."""
-    stored = []
-    for file in files:
-        store = functools.partial(_store_upload, file=file, prefix=prefix, overwrite=overwrite)
-        stored.append(await _run(store))
+    """Upload files into `prefix`. Every file is checked first: one that already exists (409, unless
+    `overwrite`) or is larger than PINCER_STORAGE_UPLOAD_FILE_MAX_SIZE (413) stores none of them."""
+    sources: list[tuple[str, IO[bytes]]] = [(file.filename or "", file.file) for file in files]
+    stored = await _run(browser, lambda b: b.upload_files(prefix, sources, overwrite=overwrite))
     logger.info("Storage: %s uploaded %s", identity.pincer_user_id, [s["key"] for s in stored])
     return {"files": stored}
 
 
 @router.post("/folders", response_model=FolderOut, status_code=201)
-async def create_folder(body: FolderIn, identity: CurrentIdentity) -> dict[str, object]:
+async def create_folder(body: FolderIn, identity: InteractiveIdentity, browser: StorageBrowserDep) -> dict[str, object]:
     """Create a folder (an empty `.keep` marker on object stores)."""
-    result = await _run(lambda b: b.mkdir(body.prefix))
+    result = await _run(browser, lambda b: b.mkdir(body.prefix))
     logger.info("Storage: %s created folder %s", identity.pincer_user_id, result["key"])
     return result
 
 
 @router.post("/move", response_model=MoveOut, response_model_by_alias=True)
-async def move(body: MoveIn, identity: CurrentIdentity) -> dict[str, object]:
-    """Move or rename a file or folder. 409 if the target exists and `overwrite` is false."""
-    result = await _run(lambda b: b.move(body.from_, body.to, overwrite=body.overwrite))
+async def move(body: MoveIn, identity: InteractiveIdentity, browser: StorageBrowserDep) -> dict[str, object]:
+    """Move or rename a file or folder. 409 if the target exists and `overwrite` is false, or if the
+    target contains the source. A source or target in a protected prefix is refused (403)."""
+    result = await _run(browser, lambda b: b.move(body.from_, body.to, overwrite=body.overwrite))
     logger.info("Storage: %s moved %s to %s", identity.pincer_user_id, result["from"], result["to"])
     return result
 
 
 @router.delete("/object", response_model=DeletedOut)
 async def delete(
-    identity: CurrentIdentity,
+    identity: InteractiveIdentity,
+    browser: StorageBrowserDep,
     key: str | None = Query(None, description="A file to delete"),
     prefix: str | None = Query(None, description="A folder to delete, with everything in it"),
 ) -> dict[str, object]:
@@ -314,6 +312,6 @@ async def delete(
         raise HTTPException(status_code=400, detail="Pass exactly one of key or prefix")
     target = key if key is not None else prefix
     assert target is not None
-    result = await _run(lambda b: b.delete(target, folder=prefix is not None))
+    result = await _run(browser, lambda b: b.delete(target, folder=prefix is not None))
     logger.info("Storage: %s deleted %s %s", identity.pincer_user_id, result["kind"], result["key"])
     return result
