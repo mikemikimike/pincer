@@ -1486,7 +1486,7 @@ class SecurityDoctor:
         return CheckResult(
             "storage_root",
             CheckStatus.PASS,
-            f"Storage root {resolved} is outside the data dir",
+            f"Storage root {resolved} does not contain the data dir",
             category="filesystem",
         )
 

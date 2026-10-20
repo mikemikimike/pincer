@@ -63,10 +63,8 @@ from pincer.storage.root import StoragePath, resolve_storage_root
 from pincer.tools.path_sandbox import SandboxDenied, confine_path
 
 if TYPE_CHECKING:
-    from cloudpathlib import CloudPath
-
     from pincer.config import Settings
-    from pincer.storage.objects import CloudObjects
+    from pincer.storage.objects import ObjectIO
     from pincer.storage.signing import Disposition
 
 logger = logging.getLogger(__name__)
@@ -77,9 +75,6 @@ _STAT_WORKERS = 16
 #: another request's in this process. A fixed set, picked by the folded key:
 #: case and Unicode variants of a name, one file on some disks, share a lock.
 _KEY_LOCKS = tuple(threading.Lock() for _ in range(64))
-#: Served inline from a cloud origin, these could run script there: S3 links
-#: to them always download (cloud links carry no CSP; see `presign`).
-_ACTIVE_TYPES = frozenset({"text/html", "image/svg+xml", "application/xhtml+xml", "application/xml", "text/xml"})
 
 
 def _iso(mtime: float | None) -> str | None:
@@ -148,8 +143,7 @@ class StorageBrowser:
         self.presign_ttl = presign_ttl
         self.upload_max_bytes = upload_max_bytes
         self._signing_key = signing_key
-        self._presigner: Any = None
-        self._objects: CloudObjects | None = None
+        self._objects: ObjectIO | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> StorageBrowser:
@@ -369,7 +363,7 @@ class StorageBrowser:
 
     # ── Reading ──
 
-    def _cloud(self) -> CloudObjects:
+    def _cloud(self) -> ObjectIO:
         """The object IO of a cloud root, built on first use."""
         assert not isinstance(self.root, Path)
         if self._objects is None:
@@ -655,12 +649,11 @@ class StorageBrowser:
     def presign(self, key: str, disposition: Disposition = "attachment") -> dict[str, Any]:
         """A link that serves `key` without a bearer token, valid for `presign_ttl` seconds.
 
-        Cloud roots sign with the provider; local roots get a relative
-        `/api/storage/signed/<token>` URL, HMAC-signed (see `pincer.storage.signing`).
-        Only the API's own responses carry the nosniff and sandbox headers. A
-        cloud link is served by the provider from its own origin, so S3 links
-        to HTML, SVG and XML always download; Azure and GCS links are served
-        with the type the object was stored with.
+        Cloud roots sign with the provider (see `pincer.storage.objects`); local
+        roots get a relative `/api/storage/signed/<token>` URL, HMAC-signed (see
+        `pincer.storage.signing`). Only the API's own responses carry the
+        nosniff and sandbox headers: a cloud link is served by the provider,
+        from its own origin.
         """
         path = self._file(key)
         normalized = normalize_key(key)
@@ -668,53 +661,8 @@ class StorageBrowser:
         if isinstance(path, Path):
             url = f"/api/storage/signed/{self.sign(normalized, expires, disposition)}"
         else:
-            url = self._presign_cloud(path, disposition)
+            url = self._cloud().presign(path, disposition, self.presign_ttl)
         return {"url": url, "expires_at": datetime.fromtimestamp(expires, UTC).isoformat()}
-
-    def _presign_cloud(self, path: CloudPath, disposition: Disposition) -> str:
-        from cloudpathlib import S3Client
-
-        client = path.client
-        if isinstance(client, S3Client):
-            # cloudpathlib's presign has no response headers; S3 takes them as
-            # parameters, so a download link downloads instead of navigating.
-            from urllib.parse import quote
-
-            content_type = content_type_for(path.name)
-            if content_type in _ACTIVE_TYPES:
-                disposition = "attachment"
-            url: str = self._s3_presigner(client).generate_presigned_url(
-                "get_object",
-                Params={
-                    "Bucket": path.bucket,  # type: ignore[attr-defined]
-                    "Key": path.key,  # type: ignore[attr-defined]
-                    "ResponseContentDisposition": f"{disposition}; filename*=UTF-8''{quote(path.name)}",
-                    "ResponseContentType": content_type,
-                },
-                ExpiresIn=self.presign_ttl,
-            )
-            return url
-        return path.as_url(presign=True, expire_seconds=self.presign_ttl)
-
-    def _s3_presigner(self, client: Any) -> Any:
-        """A boto3 client like `client`'s, but signing with SigV4.
-
-        boto3 may presign with SigV2 against a custom endpoint, and S3-compatible
-        servers (SeaweedFS, MinIO) reject a SigV2 link that carries response-*
-        parameters. AWS itself has deprecated SigV2.
-        """
-        if self._presigner is None:
-            from botocore.config import Config
-
-            base = client.client.meta
-            config = Config(signature_version="s3v4")
-            self._presigner = client.sess.client(
-                "s3",
-                endpoint_url=base.endpoint_url,
-                region_name=base.region_name,
-                config=base.config.merge(config) if base.config is not None else config,
-            )
-        return self._presigner
 
     def sign(self, key: str, expires: int, disposition: Disposition) -> str:
         return signing.sign(self._signing_key, key, expires, disposition)

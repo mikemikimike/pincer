@@ -432,7 +432,7 @@ Keys are POSIX paths relative to the root (`reports/q1.pdf`; `""` is the root). 
 
 **Protected prefixes.** When the skills dir lies under the root, its prefix is protected: deleting or moving it, anything inside it, or any of its parent folders is a `403`, and so is moving something into it. Files inside it can still be read, uploaded and edited. On a local root the check follows the folder on disk, not the key: a different-case key on a case-insensitive filesystem, a Unicode variant of a name, or a symlink leading into the skills dir is refused the same way. A symlink that points into it can itself be deleted or moved; that leaves the skills dir alone.
 
-Every route needs a bearer token, except `/api/storage/signed/{token}`. Reading needs any authenticated identity. The routes that change something (`PUT /text`, `POST /upload`, `POST /folders`, `POST /move`, `DELETE /object`) need a signed-in session: an API key gets `403` there, and with `PINCER_AUTH_DISABLED` a request without an identity gets `401`.
+Every route except `/api/storage/signed/{token}` needs a bearer token. Reading needs any authenticated identity. The routes that change something (`PUT /text`, `POST /upload`, `POST /folders`, `POST /move`, `DELETE /object`) need a signed-in session: an API key gets `403` there. With `PINCER_AUTH_DISABLED`, reads need no token, but the routes that change something still need a signed-in session (`401` without one).
 
 | Status | Meaning |
 |---|---|

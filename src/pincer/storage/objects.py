@@ -1,4 +1,4 @@
-"""Reading and writing objects of a cloud storage root through the provider SDK.
+"""Reading, writing and presigning objects of a cloud storage root.
 
 cloudpathlib maps every key to one file in its local cache, shared by every
 request: a save that overlaps a download of the same key can upload the old
@@ -23,18 +23,27 @@ import io
 import logging
 import shutil
 from typing import IO, TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from pincer.storage.errors import KeyConflict, KeyNotFound
-from pincer.storage.keys import etag
+from pincer.storage.keys import content_type_for, etag
 from pincer.storage.limits import COPY_CHUNK
 
 if TYPE_CHECKING:
     from cloudpathlib import CloudPath
 
+    from pincer.storage.signing import Disposition
+
 logger = logging.getLogger(__name__)
 
+#: Served inline from a cloud origin, these could run script there: S3 links
+#: to them always download (a provider link carries none of the API's headers).
+_ACTIVE_TYPES = frozenset({"text/html", "image/svg+xml", "application/xhtml+xml", "application/xml", "text/xml"})
 
-def objects_for(root: CloudPath) -> CloudObjects:
+type ObjectIO = PathObjects | SdkObjects
+
+
+def objects_for(root: CloudPath) -> ObjectIO:
     """The object IO for `root`'s client."""
     from cloudpathlib import AzureBlobClient, GSClient, S3Client
 
@@ -45,12 +54,16 @@ def objects_for(root: CloudPath) -> CloudObjects:
         return AzureObjects(client)
     if isinstance(client, GSClient):
         return GSObjects(client)
-    return CloudObjects()
+    return PathObjects()
 
 
-class CloudObjects:
-    """Object IO through cloudpathlib itself, for a client with no SDK of its
-    own below it (cloudpathlib's local test clients). The conditions are
+def _provider_link(path: CloudPath, ttl: int) -> str:
+    return path.as_url(presign=True, expire_seconds=ttl)
+
+
+class PathObjects:
+    """Object IO through cloudpathlib's path API, for a client with no SDK of
+    its own below it (cloudpathlib's local test clients). The conditions are
     checked before the write, not by the store, so only the browser's
     in-process lock keeps the check and the write together."""
 
@@ -78,7 +91,7 @@ class CloudObjects:
     ) -> None:
         if if_absent and path.exists():
             raise KeyConflict(f"{path} already exists")
-        if if_version is not None:
+        if if_version is not None and not if_absent:
             try:
                 current = self.read(path)[1]
             except KeyNotFound:
@@ -88,13 +101,61 @@ class CloudObjects:
         with path.open("wb", force_overwrite_to_cloud=True) as out:
             shutil.copyfileobj(source, out, COPY_CHUNK)
 
+    def presign(self, path: CloudPath, disposition: Disposition, ttl: int) -> str:
+        """A link that serves `path` without credentials for `ttl` seconds."""
+        return _provider_link(path, ttl)
 
-class S3Objects(CloudObjects):
+
+class SdkObjects:
+    """Object IO straight through a provider SDK, with conditions the store enforces.
+
+    `write` decides the condition once: `if_absent` (create only) wins over
+    `if_version`. Each provider sends it in `_put` and says in `_refused`
+    whether an error is that condition failing.
+    """
+
+    def read(self, path: CloudPath) -> tuple[bytes, object]:
+        raise NotImplementedError
+
+    def open(self, path: CloudPath) -> IO[bytes]:
+        raise NotImplementedError
+
+    def _put(self, path: CloudPath, source: IO[bytes], content_type: str, *, version: object, absent: bool) -> None:
+        raise NotImplementedError
+
+    def _refused(self, error: Exception) -> bool:
+        raise NotImplementedError
+
+    def write(
+        self,
+        path: CloudPath,
+        source: IO[bytes],
+        *,
+        content_type: str,
+        if_version: object = None,
+        if_absent: bool = False,
+    ) -> None:
+        try:
+            self._put(path, source, content_type, version=None if if_absent else if_version, absent=if_absent)
+        except Exception as e:
+            if self._refused(e):
+                raise KeyConflict(f"{path} changed or already exists") from e
+            raise
+
+    def presign(self, path: CloudPath, disposition: Disposition, ttl: int) -> str:
+        """A link that serves `path` without credentials for `ttl` seconds.
+        Served with the content type the object was stored with."""
+        return _provider_link(path, ttl)
+
+
+class S3Objects(SdkObjects):
     """S3 through boto3: `IfMatch` on the ETag, `IfNoneMatch: *` for a new object."""
 
     def __init__(self, client: Any) -> None:
+        self._client = client
         self._s3 = client.client
         self._unconditional = False
+        self._presigner: Any = None
 
     def _get(self, path: CloudPath) -> Any:
         from botocore.exceptions import ClientError
@@ -114,22 +175,14 @@ class S3Objects(CloudObjects):
     def open(self, path: CloudPath) -> IO[bytes]:
         return self._get(path)["Body"]  # type: ignore[no-any-return]
 
-    def write(
-        self,
-        path: CloudPath,
-        source: IO[bytes],
-        *,
-        content_type: str,
-        if_version: object = None,
-        if_absent: bool = False,
-    ) -> None:
+    def _put(self, path: CloudPath, source: IO[bytes], content_type: str, *, version: object, absent: bool) -> None:
         from botocore.exceptions import ClientError, ParamValidationError
 
         condition: dict[str, Any] = {}
-        if if_absent:
+        if absent:
             condition["IfNoneMatch"] = "*"
-        elif if_version is not None:
-            condition["IfMatch"] = if_version
+        elif version is not None:
+            condition["IfMatch"] = version
         start = source.tell()
 
         def put(**extra: Any) -> None:
@@ -148,10 +201,7 @@ class S3Objects(CloudObjects):
         try:
             put(**condition)
         except ClientError as e:
-            code = e.response.get("Error", {}).get("Code")
-            if code in ("PreconditionFailed", "ConditionalRequestConflict"):
-                raise KeyConflict(f"{path} changed or already exists") from e
-            if code != "NotImplemented":
+            if e.response.get("Error", {}).get("Code") != "NotImplemented":
                 raise
             self._fall_back(path, e)
             put()
@@ -159,6 +209,14 @@ class S3Objects(CloudObjects):
             # A botocore from before conditional writes.
             self._fall_back(path, e)
             put()
+
+    def _refused(self, error: Exception) -> bool:
+        from botocore.exceptions import ClientError
+
+        return isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in (
+            "PreconditionFailed",
+            "ConditionalRequestConflict",
+        )
 
     def _fall_back(self, path: CloudPath, error: Exception) -> None:
         """Some S3-compatible servers have no conditional writes: write without
@@ -169,6 +227,45 @@ class S3Objects(CloudObjects):
             path.bucket,  # type: ignore[attr-defined]
             error,
         )
+
+    def presign(self, path: CloudPath, disposition: Disposition, ttl: int) -> str:
+        """A SigV4 link carrying the response headers: cloudpathlib's presign
+        has none, and S3 takes them as parameters, so a download link
+        downloads instead of navigating."""
+        content_type = content_type_for(path.name)
+        if content_type in _ACTIVE_TYPES:
+            disposition = "attachment"
+        url: str = self._s3_presigner().generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": path.bucket,  # type: ignore[attr-defined]
+                "Key": path.key,  # type: ignore[attr-defined]
+                "ResponseContentDisposition": f"{disposition}; filename*=UTF-8''{quote(path.name)}",
+                "ResponseContentType": content_type,
+            },
+            ExpiresIn=ttl,
+        )
+        return url
+
+    def _s3_presigner(self) -> Any:
+        """A boto3 client like the root's, but signing with SigV4.
+
+        boto3 may presign with SigV2 against a custom endpoint, and S3-compatible
+        servers (SeaweedFS, MinIO) reject a SigV2 link that carries response-*
+        parameters. AWS itself has deprecated SigV2.
+        """
+        if self._presigner is None:
+            from botocore.config import Config
+
+            base = self._s3.meta
+            config = Config(signature_version="s3v4")
+            self._presigner = self._client.sess.client(
+                "s3",
+                endpoint_url=base.endpoint_url,
+                region_name=base.region_name,
+                config=base.config.merge(config) if base.config is not None else config,
+            )
+        return self._presigner
 
 
 class _Reader(io.RawIOBase):
@@ -185,18 +282,20 @@ class _Reader(io.RawIOBase):
         return data
 
 
-class AzureObjects(CloudObjects):
+class AzureObjects(SdkObjects):
     """Azure Blob through azure-storage-blob: `If-Match` on the ETag, no overwrite for a new blob."""
 
     def __init__(self, client: Any) -> None:
         self._service = client.service_client
 
+    def _blob(self, path: CloudPath) -> Any:
+        return self._service.get_blob_client(container=path.container, blob=path.blob)  # type: ignore[attr-defined]
+
     def _download(self, path: CloudPath) -> Any:
         from azure.core.exceptions import ResourceNotFoundError
 
-        blob = self._service.get_blob_client(container=path.container, blob=path.blob)  # type: ignore[attr-defined]
         try:
-            return blob.download_blob()
+            return self._blob(path).download_blob()
         except ResourceNotFoundError as e:
             raise KeyNotFound(f"No such file: {path}") from e
 
@@ -207,35 +306,24 @@ class AzureObjects(CloudObjects):
     def open(self, path: CloudPath) -> IO[bytes]:
         return _Reader(self._download(path))  # type: ignore[return-value]
 
-    def write(
-        self,
-        path: CloudPath,
-        source: IO[bytes],
-        *,
-        content_type: str,
-        if_version: object = None,
-        if_absent: bool = False,
-    ) -> None:
+    def _put(self, path: CloudPath, source: IO[bytes], content_type: str, *, version: object, absent: bool) -> None:
         from azure.core import MatchConditions
-        from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
         from azure.storage.blob import ContentSettings
 
         condition: dict[str, Any] = {}
-        if if_version is not None and not if_absent:
-            condition = {"etag": if_version, "match_condition": MatchConditions.IfNotModified}
-        blob = self._service.get_blob_client(container=path.container, blob=path.blob)  # type: ignore[attr-defined]
-        try:
-            blob.upload_blob(
-                source,
-                overwrite=not if_absent,
-                content_settings=ContentSettings(content_type=content_type),
-                **condition,
-            )
-        except (ResourceExistsError, ResourceModifiedError) as e:
-            raise KeyConflict(f"{path} changed or already exists") from e
+        if version is not None:
+            condition = {"etag": version, "match_condition": MatchConditions.IfNotModified}
+        self._blob(path).upload_blob(
+            source, overwrite=not absent, content_settings=ContentSettings(content_type=content_type), **condition
+        )
+
+    def _refused(self, error: Exception) -> bool:
+        from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
+
+        return isinstance(error, ResourceExistsError | ResourceModifiedError)
 
 
-class GSObjects(CloudObjects):
+class GSObjects(SdkObjects):
     """Google Cloud Storage through google-cloud-storage: `ifGenerationMatch`, 0 for a new object."""
 
     def __init__(self, client: Any) -> None:
@@ -258,23 +346,15 @@ class GSObjects(CloudObjects):
     def open(self, path: CloudPath) -> IO[bytes]:
         return self._blob(path).open("rb")  # type: ignore[no-any-return]
 
-    def write(
-        self,
-        path: CloudPath,
-        source: IO[bytes],
-        *,
-        content_type: str,
-        if_version: object = None,
-        if_absent: bool = False,
-    ) -> None:
+    def _put(self, path: CloudPath, source: IO[bytes], content_type: str, *, version: object, absent: bool) -> None:
+        condition: dict[str, Any] = {}
+        if absent:
+            condition["if_generation_match"] = 0
+        elif version is not None:
+            condition["if_generation_match"] = version
+        self._blob(path).upload_from_file(source, content_type=content_type, **condition)
+
+    def _refused(self, error: Exception) -> bool:
         from google.api_core.exceptions import PreconditionFailed
 
-        condition: dict[str, Any] = {}
-        if if_absent:
-            condition["if_generation_match"] = 0
-        elif if_version is not None:
-            condition["if_generation_match"] = if_version
-        try:
-            self._blob(path).upload_from_file(source, content_type=content_type, **condition)
-        except PreconditionFailed as e:
-            raise KeyConflict(f"{path} changed or already exists") from e
+        return isinstance(error, PreconditionFailed)

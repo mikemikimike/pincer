@@ -18,7 +18,7 @@ from pincer.config.main import _RelaxedSettings
 from pincer.storage import clients, signing
 from pincer.storage.browser import StorageBrowser
 from pincer.storage.errors import InvalidKey, InvalidSignature, KeyConflict, KeyNotFound, ProtectedKey, TooLarge
-from pincer.storage.objects import AzureObjects, CloudObjects, GSObjects, S3Objects, objects_for
+from pincer.storage.objects import AzureObjects, GSObjects, PathObjects, S3Objects, objects_for
 
 
 def _local(tmp_path: Path, protected: list[str] | None = None) -> StorageBrowser:
@@ -324,8 +324,8 @@ def _s3_client(tmp_path: Path) -> Any:
 def test_presign_s3_signs_v4_with_response_disposition(tmp_path: Path) -> None:
     from urllib.parse import parse_qs, urlsplit
 
-    browser = StorageBrowser(object(), [], 900, b"k" * 32)  # type: ignore[arg-type]
-    url = browser._presign_cloud(_s3_client(tmp_path).CloudPath("s3://b/dir/r é.pdf"), "attachment")
+    client = _s3_client(tmp_path)
+    url = S3Objects(client).presign(client.CloudPath("s3://b/dir/r é.pdf"), "attachment", 900)
 
     parts = urlsplit(url)
     query = parse_qs(parts.query)
@@ -342,8 +342,8 @@ def test_presign_s3_never_serves_active_content_inline(tmp_path: Path, name: str
     """A cloud link carries no CSP: HTML or SVG shown inline could run script on the bucket's origin."""
     from urllib.parse import parse_qs, urlsplit
 
-    browser = StorageBrowser(object(), [], 900, b"k" * 32)  # type: ignore[arg-type]
-    url = browser._presign_cloud(_s3_client(tmp_path).CloudPath(f"s3://b/{name}"), "inline")
+    client = _s3_client(tmp_path)
+    url = S3Objects(client).presign(client.CloudPath(f"s3://b/{name}"), "inline", 900)
     assert parse_qs(urlsplit(url).query)["response-content-disposition"][0].startswith(f"{disposition};")
 
 
@@ -360,7 +360,7 @@ def test_objects_for_picks_the_sdk_of_the_client(tmp_path: Path, mock_cloud_clie
     assert isinstance(objects_for(azure.CloudPath("az://c/")), AzureObjects)
     gcs = cloudpathlib.GSClient(storage_client=MagicMock())
     assert isinstance(objects_for(gcs.CloudPath("gs://b/")), GSObjects)
-    assert type(objects_for(mock_cloud_client("s3").CloudPath("s3://b/"))) is CloudObjects
+    assert type(objects_for(mock_cloud_client("s3").CloudPath("s3://b/"))) is PathObjects
 
 
 def _stubbed_s3(tmp_path: Path) -> tuple[Any, Any, S3Objects]:
@@ -395,6 +395,49 @@ def test_s3_read_and_conditional_writes_go_through_boto3(tmp_path: Path) -> None
     stub.assert_no_pending_responses()
     # Nothing went through cloudpathlib's shared cache.
     assert not (tmp_path / "cache").exists() or not any((tmp_path / "cache").rglob("*.md"))
+
+
+def test_create_only_wins_over_a_version_on_every_provider(tmp_path: Path) -> None:
+    """Passing both `if_absent` and `if_version` sends only the create-only condition."""
+    from botocore.stub import ANY
+
+    client, stub, s3 = _stubbed_s3(tmp_path)
+    stub.add_response(
+        "put_object",
+        {},
+        {"Bucket": "b", "Key": "a.txt", "Body": ANY, "ContentType": "text/plain", "IfNoneMatch": "*"},
+    )
+    with stub:
+        s3.write(
+            client.CloudPath("s3://b/a.txt"),
+            io.BytesIO(b"a"),
+            content_type="text/plain",
+            if_version='"e1"',
+            if_absent=True,
+        )
+    stub.assert_no_pending_responses()
+
+    service = MagicMock()
+    AzureObjects(SimpleNamespace(service_client=service)).write(
+        SimpleNamespace(container="c", blob="a.txt"),  # type: ignore[arg-type]
+        io.BytesIO(b"a"),
+        content_type="text/plain",
+        if_version='"e1"',
+        if_absent=True,
+    )
+    azure_kwargs = service.get_blob_client.return_value.upload_blob.call_args.kwargs
+    assert azure_kwargs["overwrite"] is False
+    assert "etag" not in azure_kwargs and "match_condition" not in azure_kwargs
+
+    gcs = MagicMock()
+    GSObjects(SimpleNamespace(client=gcs)).write(
+        SimpleNamespace(bucket="b", blob="a.txt"),  # type: ignore[arg-type]
+        io.BytesIO(b"a"),
+        content_type="text/plain",
+        if_version=7,
+        if_absent=True,
+    )
+    assert gcs.bucket.return_value.blob.return_value.upload_from_file.call_args.kwargs["if_generation_match"] == 0
 
 
 def test_s3_missing_object_is_key_not_found(tmp_path: Path) -> None:
