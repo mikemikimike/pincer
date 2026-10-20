@@ -3245,7 +3245,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },
     { name = "azure-identity", marker = "extra == 'remote-skills'", specifier = ">=1.15" },
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.7.0" },
-    { name = "cloudpathlib", extras = ["s3", "azure", "gs"], marker = "extra == 'remote-skills'", specifier = ">=0.25" },
+    { name = "cloudpathlib", extras = ["s3", "azure", "gs"], marker = "extra == 'remote-skills'", specifier = ">=0.25,<0.27" },
     { name = "croniter", specifier = ">=5.0" },
     { name = "deepgram-sdk", marker = "extra == 'voice'", specifier = ">=3.0" },
     { name = "discord-py", extras = ["voice"], specifier = ">=2.3,<3.0" },

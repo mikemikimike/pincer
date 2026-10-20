@@ -5,8 +5,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic.networks import AnyHttpUrl
+
+from pincer.storage.limits import DEFAULT_UPLOAD_MAX_BYTES
 
 
 class LogLevel(StrEnum):
@@ -80,6 +82,25 @@ class CoreSettings(BaseModel):
         default=None, description="Path to a Google service-account JSON key file"
     )
     storage_gcs_project: str | None = Field(default=None, description="Google Cloud project ID")
+    # ── Storage browser (/api/storage) ──
+    storage_root: str | Path | None = Field(
+        default=None,
+        description="Root the storage browser serves: a local path or an s3://, az:// or gs:// URI. "
+        "Unset = the bucket/container of a cloud skills_dir, else <data_dir>/storage",
+    )
+    storage_presign_ttl: int = Field(
+        default=900,
+        ge=60,
+        le=7 * 24 * 3600,
+        description="Lifetime in seconds of the presigned download/preview links the storage browser hands out "
+        "(60 to 604800, i.e. 1 minute to 7 days)",
+    )
+    storage_upload_file_max_size: int = Field(
+        default=DEFAULT_UPLOAD_MAX_BYTES,
+        ge=1,
+        description="Largest file the storage browser accepts in an upload: bytes, or a size such as 20MB, "
+        "512KB or 1GB (binary units: 1MB = 1024 * 1024 bytes)",
+    )
     mcp_instructions_max_chars: int = Field(
         default=400,
         ge=0,
@@ -111,15 +132,29 @@ class CoreSettings(BaseModel):
         description="ngrok static domain, e.g. my-bot.ngrok-free.app (PINCER_NGROK_DOMAIN)",
     )
 
-    @field_validator("skills_dir", mode="before")
+    @field_validator("skills_dir", "storage_root", mode="before")
     @classmethod
-    def _keep_remote_skills_uri(cls, value: Any) -> Any:
+    def _keep_remote_storage_uri(cls, value: Any, info: ValidationInfo) -> Any:
         """Keep cloud URIs as strings: Path coercion would collapse `s3://` into `s3:/`."""
-        from pincer.tools.skills.storage import is_remote_uri
+        from pincer.storage.clients import is_remote_uri
 
+        if info.field_name == "storage_root" and value in (None, ""):
+            return None
         if isinstance(value, str) and is_remote_uri(value):
             return value
         return Path(value).expanduser()
+
+    @field_validator("storage_upload_file_max_size", mode="before")
+    @classmethod
+    def _parse_size(cls, value: Any) -> Any:
+        """Accept "20MB", "20 Mb", "512k" as well as a plain byte count."""
+        if not isinstance(value, str):
+            return value
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(?:i?b)?\s*", value, re.IGNORECASE)
+        if not match:
+            raise ValueError(f"not a size: {value!r} (use bytes, or e.g. 20MB, 512KB, 1GB)")
+        number, unit = match.groups()
+        return int(float(number) * 1024 ** "_kmgt".index(unit.lower() or "_"))
 
     @field_validator("skills_cache_dir", mode="before")
     @classmethod

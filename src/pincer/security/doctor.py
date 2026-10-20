@@ -133,9 +133,10 @@ class SecurityDoctor:
         report.checks.append(self._check_budget_limits(settings))
         report.checks.append(self._check_rate_limits(settings))
         report.checks.append(self._check_tool_call_limits(settings))
-        # Filesystem (4 checks)
+        # Filesystem (5 checks)
         report.checks.append(self._check_data_dir_permissions())
         report.checks.append(self._check_skills_dir_permissions(settings))
+        report.checks.append(self._check_storage_root(settings))
         report.checks.append(self._check_no_world_readable_secrets())
         report.checks.append(self._check_sqlite_not_world_readable())
         # Network (2 checks)
@@ -1429,7 +1430,7 @@ class SecurityDoctor:
         )
 
     def _check_skills_dir_permissions(self, cfg: Settings | None = None) -> CheckResult:
-        from pincer.tools.skills.storage import is_remote_uri
+        from pincer.storage.clients import is_remote_uri
 
         if isinstance(self.skills_dir, str) and is_remote_uri(self.skills_dir):
             return self._check_remote_skills_root(self.skills_dir, self._cfg(cfg))
@@ -1454,6 +1455,38 @@ class SecurityDoctor:
             CheckStatus.WARNING,
             f"Skills dir permissions: {mode}",
             fix_hint="chmod 750 ~/.pincer/skills/",
+            category="filesystem",
+        )
+
+    def _check_storage_root(self, cfg: Settings | None = None) -> CheckResult:
+        """A local storage root must not contain the data dir: the storage
+        browser would serve the JWT secret and the database to any identity."""
+        from pincer.storage.clients import is_remote_uri
+        from pincer.storage.root import data_dir_conflict
+
+        settings = self._cfg(cfg)
+        root = settings.storage_root
+        if root is None or is_remote_uri(root):
+            return CheckResult(
+                "storage_root",
+                CheckStatus.SKIPPED,
+                "No local PINCER_STORAGE_ROOT set (the default, <data_dir>/storage, is safe)",
+                category="filesystem",
+            )
+        resolved = Path(root).expanduser().resolve()
+        problem = data_dir_conflict(resolved, Path(settings.data_dir).expanduser().resolve())
+        if problem:
+            return CheckResult(
+                "storage_root",
+                CheckStatus.CRITICAL,
+                f"{problem}: the storage browser refuses to serve it",
+                fix_hint="Point PINCER_STORAGE_ROOT at a folder outside PINCER_DATA_DIR, or unset it",
+                category="filesystem",
+            )
+        return CheckResult(
+            "storage_root",
+            CheckStatus.PASS,
+            f"Storage root {resolved} does not contain the data dir",
             category="filesystem",
         )
 

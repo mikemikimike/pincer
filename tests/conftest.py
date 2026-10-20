@@ -570,8 +570,34 @@ class SkillRoots:
         return self._make_external(name)
 
 
+@pytest.fixture
+def mock_cloud_client(tmp_path: Path) -> Callable[..., Any]:
+    """Factory for cloudpathlib's offline mock clients: `mock_cloud_client("s3")`.
+
+    The simulated bucket of a backend lives in `<tmp_path>/<backend>-storage`
+    and is shared by every client made for it; `cache` names each client's own
+    file cache (`<tmp_path>/<backend>-<cache>`). Extra keyword arguments go to
+    the client (e.g. `file_cache_mode`).
+    """
+
+    def make(backend: str, cache: str = "cache", **kwargs: Any) -> Any:
+        local = pytest.importorskip("cloudpathlib.local")
+        common = {
+            "local_storage_dir": tmp_path / f"{backend}-storage",
+            "local_cache_dir": tmp_path / f"{backend}-{cache}",
+            **kwargs,
+        }
+        if backend == "s3":
+            return local.LocalS3Client(**common)
+        if backend == "azure":
+            return local.LocalAzureBlobClient(connection_string=_FAKE_AZURE_CONNECTION_STRING, **common)
+        return local.LocalGSClient(**common)
+
+    return make
+
+
 @pytest.fixture(params=["local", "s3", "azure", "gs"])
-def skill_root(request: pytest.FixtureRequest, tmp_path: Path) -> SkillRoots:
+def skill_root(request: pytest.FixtureRequest, tmp_path: Path, mock_cloud_client: Callable[..., Any]) -> SkillRoots:
     """Factory for skill roots on every storage backend: `skill_root("bundled")`.
 
     `local` returns a plain directory under tmp_path; the cloud params return
@@ -585,21 +611,9 @@ def skill_root(request: pytest.FixtureRequest, tmp_path: Path) -> SkillRoots:
     if backend == "local":
         return SkillRoots(lambda name: tmp_path / name, lambda name: tmp_path / name)
 
-    local = pytest.importorskip("cloudpathlib.local")
-    storage = tmp_path / f"{backend}-storage"
-
-    def make_client(cache: Path) -> Any:
-        if backend == "s3":
-            return local.LocalS3Client(local_storage_dir=storage, local_cache_dir=cache)
-        if backend == "azure":
-            return local.LocalAzureBlobClient(
-                local_storage_dir=storage, local_cache_dir=cache, connection_string=_FAKE_AZURE_CONNECTION_STRING
-            )
-        return local.LocalGSClient(local_storage_dir=storage, local_cache_dir=cache)
-
     prefix = {"s3": "s3://skills-bucket", "azure": "az://skills-container", "gs": "gs://skills-bucket"}[backend]
-    client = make_client(tmp_path / f"{backend}-cache")
-    external_client = make_client(tmp_path / f"{backend}-external-cache")
+    client = mock_cloud_client(backend)
+    external_client = mock_cloud_client(backend, "external-cache")
     return SkillRoots(
         lambda name: client.CloudPath(f"{prefix}/{name}"),
         lambda name: external_client.CloudPath(f"{prefix}/{name}"),

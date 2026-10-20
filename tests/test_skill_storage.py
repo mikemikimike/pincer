@@ -10,11 +10,11 @@ import pytest
 
 from pincer.config.main import _RelaxedSettings
 from pincer.exceptions import SkillLoadError
+from pincer.storage.clients import is_remote_uri
 from pincer.tools.path_sandbox import SandboxDenied
 from pincer.tools.skills.storage import (
     clear_remote_cache,
     confine_skill_path,
-    is_remote_uri,
     localize_skill_dir,
     open_skills_root,
     open_usable_skills_root,
