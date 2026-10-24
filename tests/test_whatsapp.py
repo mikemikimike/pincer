@@ -310,6 +310,8 @@ class TestWhatsAppMediaAndApproval:
 
         wa_channel._client = MagicMock()
         wa_channel._client.send_message = AsyncMock()
+        # whatsmeow's store doesn't know it as a LID.
+        wa_channel._client.get_pn_from_lid = AsyncMock(return_value=MagicMock(User=""))
 
         await wa_channel.send("491234567890", "hi")
 
