@@ -66,10 +66,11 @@ _ensure_neonize_mocks()
 if "pincer.channels.whatsapp" in sys.modules:
     del sys.modules["pincer.channels.whatsapp"]
 
-from pincer.channels.whatsapp import WhatsAppChannel  # noqa: E402
+from pincer.channels.whatsapp import WhatsAppChannel, _active_group  # noqa: E402
 
 OWNER_PHONE = "491622549781"
 OTHER_PHONE = "4917612345678"
+TOM_LID = "207855026221128"
 
 
 def _make_settings(
@@ -709,9 +710,6 @@ class TestWhatsAppRouting:
         assert "echo-msg-id" not in ch._recent_sent_ids
 
 
-TOM_LID = "207855026221128"
-
-
 def _pn_client(pn_user: str = "", error: Exception | None = None):
     """A client whose whatsmeow store maps a LID to `pn_user` ("" = unknown)."""
     client = MagicMock()
@@ -980,8 +978,8 @@ class TestGroupReplyTarget:
         await ch._on_message(ch._client, self._group_event())
 
         assert during == ["120363000000000000@g.us"]
-        assert TOM_LID not in ch._reply_targets
-        assert not ch._active_groups
+        assert ch._reply_targets[TOM_LID] == (TOM_LID, "lid")
+        assert _active_group.get() is None
         assert await ch._jid_for(TOM_LID) == f"{TOM_LID}@lid"
 
     async def test_group_target_is_dropped_when_the_handler_fails(self, captured):
@@ -991,15 +989,66 @@ class TestGroupReplyTarget:
 
         await ch._on_message(ch._client, self._group_event())
 
-        assert not ch._active_groups
+        assert _active_group.get() is None
 
-    async def test_unmentioned_group_message_sets_no_target(self, captured):
+    async def test_send_from_another_task_skips_the_group(self, captured):
+        """A scheduler reminder sent while the sender's group message is being
+        handled goes to their DM, not the group."""
+        ch = _promoting_channel()
+        ch._client = _pn_client(OTHER_PHONE)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(_incoming):
+            entered.set()
+            await release.wait()
+            return None
+
+        ch._handler = AsyncMock(side_effect=handler)
+        handling = asyncio.create_task(ch._on_message(ch._client, self._group_event()))
+        await entered.wait()
+
+        reminder = asyncio.create_task(ch._jid_for(TOM_LID))
+        assert await reminder == f"{TOM_LID}@lid"
+
+        release.set()
+        await handling
+
+    async def test_concurrent_dm_skips_the_group(self, captured):
+        ch = _promoting_channel()
+        ch._client = _pn_client(OTHER_PHONE)
+        entered, release = asyncio.Event(), asyncio.Event()
+        dm_targets: list[str] = []
+
+        async def handler(_incoming):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+            else:
+                dm_targets.append(await ch._jid_for(TOM_LID))
+            return None
+
+        ch._handler = AsyncMock(side_effect=handler)
+        group = asyncio.create_task(ch._on_message(ch._client, self._group_event()))
+        await entered.wait()
+
+        await ch._on_message(ch._client, _lid_dm())
+        assert dm_targets == [f"{TOM_LID}@lid"]
+
+        release.set()
+        await group
+
+    async def test_group_message_learns_the_senders_lid_address(self, captured):
+        """A contact who only writes in groups still gets reminders on "@lid"."""
         ch = _promoting_channel()
         ch._client = _pn_client()
+        ch._not_lids.add(TOM_LID)
 
         await ch._on_message(ch._client, self._group_event(text="just chatting"))
 
-        assert TOM_LID not in ch._reply_targets
+        assert ch._reply_targets[TOM_LID] == (TOM_LID, "lid")
+        assert ch._reply_targets[TOM_LID] != ("120363000000000000", "g.us")
+        assert TOM_LID not in ch._not_lids
+        assert await ch._jid_for(TOM_LID) == f"{TOM_LID}@lid"
 
     async def test_dm_still_sets_the_target(self, captured):
         ch = _promoting_channel()
@@ -1039,6 +1088,10 @@ class TestJidForBareLid:
         ch._client = _pn_client(error=RuntimeError("boom"))
 
         assert await ch._jid_for(OTHER_PHONE) == f"{OTHER_PHONE}@s.whatsapp.net"
+        assert OTHER_PHONE not in ch._not_lids
+        # The failure is not cached: once the store answers, the LID is found.
+        ch._client = _pn_client(TOM_LID)
+        assert await ch._jid_for(OTHER_PHONE) == f"{OTHER_PHONE}@lid"
 
 
 class TestIsSelfChat:

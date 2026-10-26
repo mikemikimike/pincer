@@ -8,6 +8,9 @@ import pytest_asyncio
 from pincer.channels.base import ChannelType
 from pincer.core.identity import IdentityProfile, IdentityResolver
 
+TOM_PHONE = "4917612345678"
+TOM_LID = "207855026221128"
+
 
 def _rows(resolver):
     """A connection to the resolver's database, for asserting on stored rows."""
@@ -1237,10 +1240,6 @@ class TestCleanup:
         ):
             assert (await cur.fetchone())[0] == 1
         assert await r.resolve(ChannelType.TELEGRAM, 12345) == uid
-
-
-TOM_PHONE = "4917612345678"
-TOM_LID = "207855026221128"
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import logging
 import threading
@@ -65,6 +66,15 @@ if TYPE_CHECKING:
     from pincer.core.identity import IdentityResolver
 
 logger = logging.getLogger(__name__)
+
+# The group whose message is being handled in this task: (sender_phone,
+# (group user, server)). Set by _on_message around the handler, so approval
+# prompts and progress for that message go back to the group, while sends from
+# other tasks (scheduler, notifications, the sender's concurrent DM) don't.
+# A task the handler itself spawns inherits it.
+_active_group: contextvars.ContextVar[tuple[str, tuple[str, str]] | None] = contextvars.ContextVar(
+    "whatsapp_active_group", default=None
+)
 
 MAX_WHATSAPP_MESSAGE_LENGTH = 4096
 
@@ -163,16 +173,12 @@ class WhatsAppChannel(BaseChannel):
         self._approval_prompt_ids: dict[str, str] = {}
         # Per-user in-place progress message: user_id → {id, jid, tools}
         self._progress: dict[str, dict[str, Any]] = {}
-        # Reply targets learned from inbound DMs: sender_phone → (user, server).
+        # Reply targets learned from inbound messages: sender_phone → (user, server).
         # Needed because sender_phone may be a LID user part that only resolves on
         # the "@lid" server — `build_jid(lid_user)` defaults to "@s.whatsapp.net"
         # and the WA server rejects it with "no LID found". Never a group: a
         # proactive send (reminder, notification) must not land in a group.
         self._reply_targets: dict[str, tuple[str, str]] = {}
-        # Groups whose message from this sender is being handled right now:
-        # sender_phone → stack of (group user, server). Prompts and progress for
-        # that message go back to the group; the entry is gone once it's handled.
-        self._active_groups: dict[str, list[tuple[str, str]]] = {}
         # Bare ids whatsmeow's store doesn't know as a LID (see _jid_for).
         self._not_lids: set[str] = set()
         # LID senders whose phone placeholder was looked up and promoted this
@@ -528,8 +534,9 @@ class WhatsAppChannel(BaseChannel):
 
         Honors, in order:
           1. An explicit "user@server" in user_id (e.g. "207855026221128@lid").
-          2. The group whose message from this user is being handled.
-          3. A server learned from an inbound DM from this user.
+          2. The group whose message from this user the current task is
+             handling (see _active_group).
+          3. A server learned from an inbound message from this user.
           4. "@lid", when whatsmeow's store maps user_id as a LID to a phone.
           5. The neonize default server (s.whatsapp.net).
 
@@ -541,16 +548,23 @@ class WhatsAppChannel(BaseChannel):
         if "@" in user_id:
             user, server = user_id.split("@", 1)
             return build_jid(user, server)
-        groups = self._active_groups.get(user_id)
-        target = groups[-1] if groups else self._reply_targets.get(user_id)
+        active = _active_group.get()
+        target = active[1] if active is not None and active[0] == user_id else self._reply_targets.get(user_id)
         if target is not None:
             user, server = target
             return build_jid(user, server)
         if self._client is not None and user_id not in self._not_lids:
-            if await self._pn_for_lid(self._client, build_jid(user_id, "lid")):
+            try:
+                pn = await self._pn_for_lid(self._client, build_jid(user_id, "lid"))
+            except Exception:
+                # Not cached: the next send looks it up again.
+                logger.debug("WA get_pn_from_lid failed for %s", user_id, exc_info=True)
+                return build_jid(user_id)
+            if pn:
                 self._reply_targets[user_id] = (user_id, "lid")
                 return build_jid(user_id, "lid")
-            # A LID the store learns later arrives with a DM, which sets step 3.
+            # A LID the store learns later arrives with a message (DM or
+            # group), which sets step 3 and clears this.
             self._not_lids.add(user_id)
         return build_jid(user_id)
 
@@ -744,13 +758,12 @@ class WhatsAppChannel(BaseChannel):
 
     @staticmethod
     async def _pn_for_lid(client: NewAClient, lid_jid: Any) -> str | None:
-        """The phone number whatsmeow's store maps this LID JID to, or None."""
-        try:
-            pn = await client.get_pn_from_lid(lid_jid)
-        except Exception:
-            # GetJIDFromStoreError, or the client is not connected.
-            logger.debug("WA get_pn_from_lid failed for %s", getattr(lid_jid, "User", lid_jid), exc_info=True)
-            return None
+        """The phone number whatsmeow's store maps this LID JID to, or None.
+
+        None means the store has no mapping. A failed lookup (store error,
+        client not connected) raises, so callers can retry it.
+        """
+        pn = await client.get_pn_from_lid(lid_jid)
         user = getattr(pn, "User", "")
         return str(user) if user else None
 
@@ -789,7 +802,12 @@ class WhatsAppChannel(BaseChannel):
         await asyncio.shield(check)
 
     async def _check_lid(self, client: NewAClient, source: Any, lid: str) -> None:
-        pn = await self._sender_pn(client, source)
+        try:
+            pn = await self._sender_pn(client, source)
+        except Exception:
+            # Retried on the sender's next message; this one is still routed.
+            logger.debug("WA get_pn_from_lid failed for %s", lid, exc_info=True)
+            return
         if not pn or self._identity is None:
             return
         try:
@@ -834,11 +852,17 @@ class WhatsAppChannel(BaseChannel):
 
             # Remember where to reply to this sender. Mirrors what the handler-
             # reply path at the bottom of this function uses (chat JID), so
-            # approval/input prompts route to the same place. A group is only
-            # remembered while its message is handled (see _active_groups).
+            # approval/input prompts route to the same place. A group is never
+            # remembered: it only applies while its message is handled (see
+            # _active_group). A LID sender's own DM address is learned from
+            # group messages too, so a contact who only writes in groups still
+            # gets reminders on "@lid".
             chat_server = source.Chat.Server
             if sender_phone and chat_user and chat_server and not is_group:
                 self._reply_targets[sender_phone] = (chat_user, chat_server)
+            elif not is_from_me and source.Sender.Server == "lid" and sender_phone:
+                self._reply_targets[sender_phone] = (sender_phone, "lid")
+                self._not_lids.discard(sender_phone)
 
             msg_type = getattr(info, "Type", None) or "unknown"
             logger.info(
@@ -991,18 +1015,13 @@ class WhatsAppChannel(BaseChannel):
             )
 
             if self._handler:
-                group_target = (chat_user, chat_server)
-                if is_group:
-                    self._active_groups.setdefault(sender_phone, []).append(group_target)
+                token = _active_group.set((sender_phone, (chat_user, chat_server))) if is_group else None
                 try:
                     response = await self._handler(incoming)
                     await self._finalize_progress(sender_phone)
                 finally:
-                    if is_group:
-                        stack = self._active_groups[sender_phone]
-                        stack.remove(group_target)
-                        if not stack:
-                            del self._active_groups[sender_phone]
+                    if token is not None:
+                        _active_group.reset(token)
                 if response:
                     reply_jid = build_jid(chat_user, source.Chat.Server)
                     for chunk in _split_whatsapp_message(response):
