@@ -632,6 +632,76 @@ async def test_a_rejected_dial_is_terminal(telemetry):
     assert aggregate.calls["active"] == 0
     assert aggregate.rates["technical_failure_rate"]["denominator"] == 2
     assert aggregate.rates["technical_failure_rate"]["numerator"] == 2
+    call = await queries.get_call(telemetry, "pending-aaa")
+    assert call is not None
+    assert (call["outcome"], call["termination_reason"]) == ("failed", "dial_rejected")
+
+
+async def test_a_timed_out_dial_with_unknown_outcome_is_not_a_rejection(telemetry):
+    """Twilio may have placed the call: the row says so, and stays a technical failure."""
+    hooks.dial_requested("pending-ddd", to_number="+4930111", engine="media_streams", language="de")
+    await hooks.dial_unknown("pending-ddd", error="TimeoutError: dial outcome unknown")
+    await _settle()
+
+    call = await queries.get_call(telemetry, "pending-ddd")
+    assert call is not None
+    assert call["status"] == "failed"
+    assert call["outcome"] == "dial_unknown"
+    assert call["termination_reason"] == "dial_unknown"
+    assert call["failure_code"] == "twilio_api"
+    assert call["failure_category"] == "technical"
+    names = [e["name"] for e in await queries.get_events(telemetry, call["call_id"])]
+    assert "call.dial_unknown" in names
+    assert "call.dial_rejected" not in names
+    assert runtime.tracer_for("pending-ddd") is None
+
+    aggregate = await queries.overview(telemetry, queries.CallFilters.for_hours(1))
+    assert aggregate.calls["active"] == 0
+    assert aggregate.rates["technical_failure_rate"]["numerator"] == 1
+
+
+@pytest.mark.parametrize(
+    ("twilio_status", "failure_code"),
+    [
+        ("completed", "unknown"),
+        ("busy", "busy"),
+        ("no-answer", "no_answer"),
+        ("failed", "call_setup"),
+        ("canceled", "call_setup"),
+    ],
+)
+async def test_a_dial_that_ended_before_it_was_confirmed_is_not_a_success(telemetry, twilio_status, failure_code):
+    """The post-timeout lookup finds the call already over. Twilio's own word
+    for it (`completed` included) is not our call status: nobody was briefed."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from pincer.voice import outbound
+
+    class Dialer:
+        async def find_call(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(sid="CA_over", status=twilio_status)
+
+    hooks.dial_requested("pending-eee", to_number="+4930111", engine="conversation_relay", language="de")
+    with pytest.raises(outbound._DialEnded):
+        await outbound._recover_unconfirmed_dial(
+            Dialer(),
+            SimpleNamespace(twilio_phone_number="+4930999"),
+            "+4930111",
+            datetime.now(UTC),
+            trace_key="pending-eee",
+            error="TimeoutError: dial outcome unknown",
+        )
+    await _settle()
+
+    aggregate = await queries.overview(telemetry, queries.CallFilters.for_hours(1))
+    assert aggregate.calls["completed"] == 0
+    # By the pre-dial key: dial_accepted re-keys the tracer, not the stored row.
+    call = await queries.get_call(telemetry, "pending-eee")
+    assert call is not None
+    assert call["status"] == "failed"
+    assert call["failure_code"] == failure_code
+    assert call["termination_reason"] == "ended_before_confirmed"
 
 
 async def test_a_rejected_dial_closes_even_when_the_write_backlog_is_full(telemetry, monkeypatch):

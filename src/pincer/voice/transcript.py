@@ -52,6 +52,9 @@ class TranscriptEntry:
     is_final: bool = True
     state: str = ""
     timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    # The last agent line of a provider utterance (sent with last=True). A
+    # streamed turn spans several; see mark_interrupted().
+    ends_utterance: bool = False
 
 
 @dataclass
@@ -101,7 +104,11 @@ class TranscriptLogger:
         confidence: float = 1.0,
         is_final: bool = True,
         state: str = "",
+        position: int | None = None,
     ) -> None:
+        """Append a line, or with `position` insert it there: a line whose
+        send was cancelled is logged where the send began, before whatever
+        was logged while it was in flight."""
         entry = TranscriptEntry(
             speaker=speaker,
             text=text,
@@ -109,8 +116,72 @@ class TranscriptLogger:
             is_final=is_final,
             state=state,
         )
-        self._entries.append(entry)
+        if position is None:
+            self._entries.append(entry)
+        else:
+            self._entries.insert(position, entry)
         logger.debug("[%s] %s: %s", self._call_sid, speaker, text[:100])
+
+    def end_agent_utterance(self) -> None:
+        """The agent line just logged closes a provider utterance."""
+        if self._entries and self._entries[-1].speaker == Speaker.AGENT:
+            self._entries[-1].ends_utterance = True
+
+    def mark_interrupted(self, heard: str) -> int:
+        """Re-mark the agent lines of the current reply the caller did not hear.
+
+        `heard` is what the provider says it played before the caller cut in
+        (ConversationRelay's `utteranceUntilInterrupt`), and it covers only the
+        utterance being played — a streamed turn spans several (a filler, early
+        sentences sent with last=True). That utterance is the latest one `heard`
+        is the start of — searched from the end, because a short earlier line
+        ("Ja.") is easily a prefix of what was really playing ("Ja, der
+        Termin…") — else the latest. Utterances before it played in full
+        and keep their state; inside it, lines `heard` contains keep theirs,
+        the first one it does not was cut off ("interrupted"), and every later
+        line never played ("undelivered"). Returns how many lines were re-marked.
+        """
+
+        def _norm(value: str) -> str:
+            return " ".join(value.split()).casefold()
+
+        reply: list[TranscriptEntry] = []
+        for entry in reversed(self._entries):
+            if entry.speaker == Speaker.CALLER:
+                break
+            if entry.speaker == Speaker.AGENT:
+                reply.append(entry)
+        reply.reverse()
+        utterances: list[list[TranscriptEntry]] = []
+        for index, entry in enumerate(reply):
+            if index == 0 or reply[index - 1].ends_utterance:
+                utterances.append([])
+            utterances[-1].append(entry)
+        if not utterances:
+            return 0
+
+        heard_norm = _norm(heard)
+        playing = len(utterances) - 1
+        if heard_norm:
+            for index in range(len(utterances) - 1, -1, -1):
+                utterance = utterances[index]
+                text = _norm(" ".join(entry.text for entry in utterance))
+                if text.startswith(heard_norm) or heard_norm.startswith(_norm(utterance[0].text)):
+                    playing = index
+                    break
+
+        marked = 0
+        cut = False
+        for offset, utterance in enumerate(utterances[playing:]):
+            for entry in utterance:
+                if not cut and offset == 0 and _norm(entry.text) in heard_norm:
+                    continue
+                if entry.state == "undelivered":
+                    continue
+                entry.state = "undelivered" if cut else "interrupted"
+                cut = True
+                marked += 1
+        return marked
 
     def log_action(
         self,

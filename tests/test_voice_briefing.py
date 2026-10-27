@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import types
 from typing import Any
 from unittest.mock import MagicMock
@@ -19,6 +18,7 @@ import aiosqlite
 import pytest
 from voice_harness.fake_engine import FakeVoiceEngine
 from voice_harness.settings import apply_in_call_tool_defaults, apply_test_paths
+from voice_harness.transport_fakes import FakeSocket, install_fake_twilio
 
 from pincer.channels.phone_calls import VoiceChannel
 from pincer.voice import briefing as bf
@@ -170,7 +170,7 @@ def voice(tmp_path, monkeypatch):
     hold.set()
 
     class FakeCalls:
-        def create(self, **kwargs: Any) -> Any:
+        async def create_async(self, **kwargs: Any) -> Any:
             placed.append(kwargs)
             call = MagicMock()
             call.sid = f"CA_{len(placed)}"
@@ -180,12 +180,7 @@ def voice(tmp_path, monkeypatch):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.calls = FakeCalls()
 
-    twilio_rest = types.ModuleType("twilio.rest")
-    twilio_rest.Client = FakeClient
-    twilio_mod = types.ModuleType("twilio")
-    twilio_mod.rest = twilio_rest
-    monkeypatch.setitem(sys.modules, "twilio", twilio_mod)
-    monkeypatch.setitem(sys.modules, "twilio.rest", twilio_rest)
+    install_fake_twilio(monkeypatch, FakeClient)
 
     status_notify._reset_for_tests()
     yield types.SimpleNamespace(
@@ -207,16 +202,14 @@ async def test_state_is_registered_before_the_dial(voice):
     voice.engine.register_pending_outbound = _spy  # type: ignore[method-assign]
 
     class OrderedCalls:
-        def create(self, **kwargs: Any) -> Any:
+        async def create_async(self, **kwargs: Any) -> Any:
             seen.append("dialled")
             call = MagicMock()
             call.sid = "CA_1"
             return call
 
     voice.server._engine = voice.engine
-    import twilio.rest as twilio_rest  # noqa: PLC0415 — the fake installed by the fixture
-
-    twilio_rest.Client = lambda *a, **k: types.SimpleNamespace(calls=OrderedCalls())
+    voice.engine._rest._client = types.SimpleNamespace(calls=OrderedCalls())
 
     result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
     assert "Call SID: CA_1" in result
@@ -253,6 +246,72 @@ async def test_setup_before_registration_outbound_waits_then_binds(voice):
 
     sm = voice.channel._ensure_call_tracking(call_sid, state)
     assert TASK in voice.channel._build_voice_system(state, sm)
+
+
+async def test_setup_during_an_awaited_dial_binds_the_briefing(voice):
+    """The REST dial is awaited now, so Twilio's relay `setup` can be handled
+    while `create_async` is still in flight — before `promote_pending` has
+    re-keyed the briefed state to the CallSid. The setup must wait for it."""
+    setups: list[asyncio.Task] = []
+
+    class SetupFirstCalls:
+        async def create_async(self, **kwargs: Any) -> Any:
+            setups.append(asyncio.create_task(voice.server._resolve_setup_state("CA_mid", TARGET, "outbound-api")))
+            await asyncio.sleep(0.05)  # setup is now parked in await_call_state
+            assert not setups[0].done()
+            return types.SimpleNamespace(sid="CA_mid")
+
+    voice.server._engine = voice.engine
+    voice.engine._rest._client = types.SimpleNamespace(calls=SetupFirstCalls())
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    state = await setups[0]
+
+    assert "Call SID: CA_mid" in result
+    assert state is voice.engine.get_call_state("CA_mid")
+    assert state.direction == CallDirection.OUTBOUND
+    assert state.purpose == TASK
+
+
+# regression: structurally untestable on dev @ 0a1c320 — the sync Client held
+# the loop for the whole dial, and the sync fakes returned instantly
+async def test_a_pending_dial_does_not_stall_a_live_relay_socket(voice, monkeypatch):
+    from voice_harness.transport_fakes import FakeSocket, FakeTwilioRest
+
+    fake = FakeTwilioRest()
+    fake.hold = asyncio.Event()  # carrier dial setup takes a while
+    voice.engine._rest = fake
+    heard: list[str] = []
+
+    async def _on_speech(_sid: str, text: str) -> None:
+        heard.append(text)
+
+    voice.engine.set_on_speech(_on_speech)
+
+    async def _authenticated(*_args: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(voice.server, "_authenticate_ws", _authenticated)
+    await voice.engine.on_call_start("CA_live", "+4917612345", CallDirection.INBOUND)
+    sock = FakeSocket()
+    relay = asyncio.create_task(voice.server.relay_ws(sock))
+    sock.push(type="setup", callSid="CA_live", **{"from": "+4917612345"})
+
+    dial = asyncio.create_task(outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"}))
+    async with asyncio.timeout(2):
+        while not fake.in_flight:
+            await asyncio.sleep(0)
+
+    sock.push(type="prompt", voicePrompt="Hallo, sind Sie noch da?", last=True)
+    await asyncio.wait_for(sock.inbox.join(), timeout=2)
+
+    assert heard == ["Hallo, sind Sie noch da?"]
+    assert not dial.done()
+    fake.hold.set()
+    assert "Call SID: CA_fake" in await dial
+    assert fake.creates[-1]["to"] == TARGET
+    sock.hang_up()
+    await asyncio.wait_for(relay, timeout=2)
 
 
 async def test_setup_orphan_outbound_terminates(voice):
@@ -317,20 +376,488 @@ async def test_setup_with_unknown_sid_is_refused(voice):
     assert voice.engine.get_call_state("CA_unknown") is None
 
 
-async def test_failed_dial_discards_the_pre_registration(voice, monkeypatch):
+async def test_failed_dial_discards_the_pre_registration(voice):
     """Twilio raised → no orphaned pending state left behind."""
 
     class ExplodingCalls:
-        def create(self, **kwargs: Any) -> Any:
+        async def create_async(self, **kwargs: Any) -> Any:
             raise RuntimeError("twilio down")
 
-    import twilio.rest as twilio_rest  # noqa: PLC0415
-
-    twilio_rest.Client = lambda *a, **k: types.SimpleNamespace(calls=ExplodingCalls())
+    voice.engine._rest._client = types.SimpleNamespace(calls=ExplodingCalls())
 
     result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
     assert result.startswith("Error")
     assert voice.engine._pending_outbound == {}
+
+
+class _TimedOutCalls:
+    """create_async times out; list_async returns whatever Twilio "has"."""
+
+    def __init__(self, listed: list[Any]) -> None:
+        self.listed = listed
+
+    async def create_async(self, **kwargs: Any) -> Any:
+        raise TimeoutError
+
+    async def list_async(self, **kwargs: Any) -> list[Any]:
+        return self.listed
+
+
+async def test_timed_out_dial_that_twilio_placed_is_bound(voice):
+    """Twilio accepted the POST but answered late → the call keeps its briefing."""
+    from datetime import UTC, datetime
+
+    placed = types.SimpleNamespace(sid="CA_late", status="ringing", date_created=datetime.now(UTC))
+    voice.engine._rest._client = types.SimpleNamespace(calls=_TimedOutCalls([placed]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert "Call SID: CA_late" in result
+    state = voice.engine.get_call_state("CA_late")
+    assert state is not None and state.purpose == TASK
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_timed_out_dial_with_unknown_outcome_still_counts(voice):
+    """No call found → not reported as rejected, and the attempt is counted."""
+    from datetime import UTC, datetime, timedelta
+
+    stale = types.SimpleNamespace(sid="CA_old", date_created=datetime.now(UTC) - timedelta(hours=1))
+    voice.engine._rest._client = types.SimpleNamespace(calls=_TimedOutCalls([stale]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert result.startswith("Error") and "may still be ringing" in result
+    assert voice.engine.get_call_state("CA_old") is None
+    assert voice.engine._pending_outbound == {}
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+@pytest.fixture
+def dial_outcomes(monkeypatch):
+    """Which terminal dial hook make_phone_call called, and with what error."""
+    from pincer.voice.telemetry import hooks
+
+    seen: dict[str, list[str]] = {"rejected": [], "unknown": []}
+
+    async def rejected(temp_id: str, *, error: str) -> None:
+        seen["rejected"].append(error)
+
+    async def unknown(temp_id: str, *, error: str) -> None:
+        seen["unknown"].append(error)
+
+    monkeypatch.setattr(hooks, "dial_rejected", rejected)
+    # raising=False: before the hook existed this records the rejection instead of erroring in setup
+    monkeypatch.setattr(hooks, "dial_unknown", unknown, raising=False)
+    return seen
+
+
+async def test_timed_out_dial_with_unknown_outcome_is_recorded_as_unknown(voice, dial_outcomes):
+    """No call found → telemetry says "unknown", not "rejected"."""
+    voice.engine._rest._client = types.SimpleNamespace(calls=_TimedOutCalls([]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert "may still be ringing" in result
+    assert dial_outcomes == {"rejected": [], "unknown": ["TimeoutError: dial outcome unknown"]}
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_timed_out_dial_whose_lookup_fails_is_recorded_as_unknown(voice, dial_outcomes):
+    """The lookup itself failing leaves the outcome just as unknown."""
+
+    class LookupFails(_TimedOutCalls):
+        async def list_async(self, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("twilio list down")
+
+    voice.engine._rest._client = types.SimpleNamespace(calls=LookupFails([]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert "may still be ringing" in result
+    assert dial_outcomes == {"rejected": [], "unknown": ["TimeoutError: dial outcome unknown"]}
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_a_dial_cancelled_mid_request_leaves_nothing_pending(voice, dial_outcomes, monkeypatch):
+    """The turn that issued the tool is cancelled (a barge-in) while the POST
+    is in flight. Twilio may still place the call, so it is an unknown
+    outcome: counted, cooled down, its trace closed — and its pending entry
+    gone, or a later setup to that number could claim the stale briefing."""
+    from pincer.voice import safety_gates
+
+    recorded: list[str] = []
+
+    async def _record(settings: Any, number: str, **kwargs: Any) -> None:
+        recorded.append(number)
+
+    monkeypatch.setattr(safety_gates, "record_outbound_call", _record)
+    released = asyncio.Event()
+
+    class StuckCalls:
+        async def create_async(self, **kwargs: Any) -> Any:
+            await released.wait()
+            return types.SimpleNamespace(sid="CA_never")
+
+    voice.engine._rest._client = types.SimpleNamespace(calls=StuckCalls())
+
+    dial = asyncio.create_task(outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"}))
+    async with asyncio.timeout(2):
+        while not voice.engine._pending_outbound:
+            await asyncio.sleep(0)
+    dial.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dial
+
+    assert voice.engine._pending_outbound == {}
+    assert dial_outcomes == {"rejected": [], "unknown": ["CancelledError: dial outcome unknown"]}
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+    assert recorded == [TARGET]
+
+
+@pytest.fixture
+def dialing_notices(monkeypatch):
+    """Call SIDs the user was told are ringing."""
+    seen: list[str] = []
+
+    async def _notify(call_sid: str) -> None:
+        seen.append(call_sid)
+
+    monkeypatch.setattr(status_notify, "notify_dialing", _notify)
+    return seen
+
+
+async def test_a_claimed_call_that_ended_before_the_timeout_is_a_placed_call(voice, dialing_notices):
+    """Answered, talked, hung up — all inside the 10 s request window. The
+    relay claimed it, so it is a call that happened, not "already ended"."""
+    from datetime import UTC, datetime
+
+    class ClaimedEndedThenTimedOut:
+        async def create_async(self, **kwargs: Any) -> Any:
+            await voice.server._resolve_setup_state("CA_done", "+1000", "outbound-api", to=TARGET, verified=True)
+            await voice.engine.end_call("CA_done")
+            raise TimeoutError
+
+        async def list_async(self, **kwargs: Any) -> list[Any]:
+            return [types.SimpleNamespace(sid="CA_done", status="completed", date_created=datetime.now(UTC))]
+
+    voice.server._engine = voice.engine
+    voice.engine._rest._client = types.SimpleNamespace(calls=ClaimedEndedThenTimedOut())
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert result.startswith("Call placed and already finished.\nCall SID: CA_done\n"), result
+    assert status_notify.get_call_info("CA_done") is not None
+    assert dialing_notices == [], "no 'ringing' notice for a call that is over"
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_no_ringing_notice_for_a_claimed_call_that_already_ended(voice, dialing_notices):
+    """Same, but the REST POST returns normally after the call is over."""
+
+    class ClaimedEndedThenReturned:
+        async def create_async(self, **kwargs: Any) -> Any:
+            await voice.server._resolve_setup_state("CA_done", "+1000", "outbound-api", to=TARGET, verified=True)
+            await voice.engine.end_call("CA_done")
+            return types.SimpleNamespace(sid="CA_done")
+
+    voice.server._engine = voice.engine
+    voice.engine._rest._client = types.SimpleNamespace(calls=ClaimedEndedThenReturned())
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert result.startswith("Call placed and already finished.\nCall SID: CA_done\n"), result
+    assert dialing_notices == []
+
+
+async def test_dial_cut_off_after_the_relay_bound_it_is_a_placed_call(voice, dialing_notices, dial_outcomes):
+    """The callee answers at 2 s and the setup claims the dial; then the REST
+    response dies. The call is live and briefed, so it is a placed call — not
+    "Error placing call", which invites a redial of the person already talking."""
+    import aiohttp
+
+    class AnsweredThenDisconnected:
+        async def create_async(self, **kwargs: Any) -> Any:
+            await voice.server._resolve_setup_state("CA_live", "+1000", "outbound-api", to=TARGET, verified=True)
+            raise aiohttp.ServerDisconnectedError()
+
+        async def list_async(self, **kwargs: Any) -> list[Any]:
+            raise AssertionError("the relay already bound the call; no lookup needed")
+
+    voice.server._engine = voice.engine
+    voice.engine._rest._client = types.SimpleNamespace(calls=AnsweredThenDisconnected())
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert "Call SID: CA_live" in result
+    state = voice.engine.get_call_state("CA_live")
+    assert state is not None and state.purpose == TASK
+    assert status_notify.get_call_info("CA_live") is not None
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+    assert dial_outcomes == {"rejected": [], "unknown": []}
+
+
+async def test_dial_cut_off_with_no_call_found_is_unknown_and_counts(voice, dial_outcomes):
+    """A reset while reading the response: the POST went out, so Twilio may
+    have placed the call. Counted, and recorded as unknown."""
+    import aiohttp
+
+    class Disconnected(_TimedOutCalls):
+        async def create_async(self, **kwargs: Any) -> Any:
+            raise aiohttp.ServerDisconnectedError()
+
+    voice.engine._rest._client = types.SimpleNamespace(calls=Disconnected([]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert "may still be ringing" in result
+    assert dial_outcomes == {"rejected": [], "unknown": ["ServerDisconnectedError: dial outcome unknown"]}
+    assert voice.engine._pending_outbound == {}
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_twilio_refusing_the_dial_is_still_a_rejection(voice, dial_outcomes):
+    """Twilio answered with an error: nothing was placed, nothing is counted."""
+    from twilio.base.exceptions import TwilioRestException
+
+    class Refused(_TimedOutCalls):
+        async def create_async(self, **kwargs: Any) -> Any:
+            raise TwilioRestException(400, "/Calls.json", msg="Invalid 'To' number", code=21211)
+
+    voice.engine._rest._client = types.SimpleNamespace(calls=Refused([]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert result.startswith("Error placing call")
+    assert len(dial_outcomes["rejected"]) == 1 and dial_outcomes["unknown"] == []
+    assert voice.engine._pending_outbound == {}
+    assert sum(outbound._daily_outbound_counts.get("u1", {}).values()) == 0
+
+
+async def test_dial_that_never_connected_is_still_a_rejection(voice, dial_outcomes):
+    """No connection to Twilio at all: the POST was never sent."""
+    import aiohttp
+
+    class Unreachable(_TimedOutCalls):
+        async def create_async(self, **kwargs: Any) -> Any:
+            key = types.SimpleNamespace(host="api.twilio.com", port=443, ssl=True)
+            raise aiohttp.ClientConnectorError(key, OSError(61, "Connection refused"))
+
+    voice.engine._rest._client = types.SimpleNamespace(calls=Unreachable([]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert result.startswith("Error placing call")
+    assert len(dial_outcomes["rejected"]) == 1 and dial_outcomes["unknown"] == []
+    assert sum(outbound._daily_outbound_counts.get("u1", {}).values()) == 0
+
+
+async def test_timed_out_dial_that_already_ended_is_not_promoted(voice):
+    """The lookup finds the call, but it is over (declined, busy, hung up):
+    promoting it would park a dead state in _active_calls that no status
+    callback will ever remove, and tell the user the call is ringing."""
+    from datetime import UTC, datetime
+
+    done = types.SimpleNamespace(sid="CA_done", status="completed", date_created=datetime.now(UTC))
+    voice.engine._rest._client = types.SimpleNamespace(calls=_TimedOutCalls([done]))
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert result.startswith("Error") and "CA_done" in result and "already ended" in result
+    assert voice.engine.get_call_state("CA_done") is None
+    assert voice.engine._pending_outbound == {}
+    assert status_notify.get_call_info("CA_done") is None, "no 'ringing' notification for an ended call"
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_setup_during_a_slow_dial_claims_the_pending_state_by_number(voice):
+    """The callee can pick up before Twilio has answered the REST POST. The
+    relay setup must bind to the pending dial by its `to` number right away,
+    not wait out a 3 s poll for a promotion that is up to 10 s away."""
+    released = asyncio.Event()
+
+    class SlowCalls:
+        async def create_async(self, **kwargs: Any) -> Any:
+            await released.wait()
+            return types.SimpleNamespace(sid="CA_claim")
+
+    voice.server._engine = voice.engine
+    voice.engine._rest._client = types.SimpleNamespace(calls=SlowCalls())
+
+    dial = asyncio.create_task(outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"}))
+    async with asyncio.timeout(2):
+        while not voice.engine._pending_outbound:
+            await asyncio.sleep(0)
+
+    async with asyncio.timeout(1):  # well under SETUP_STATE_WAIT_S: no polling involved
+        state = await voice.server._resolve_setup_state("CA_claim", "+1000", "outbound-api", to=TARGET, verified=True)
+
+    assert state is not None and state.purpose == TASK
+    assert voice.engine.get_call_state("CA_claim") is state
+    assert voice.engine._pending_outbound == {}
+    assert not dial.done()
+
+    released.set()
+    assert "Call SID: CA_claim" in await dial
+    assert voice.engine.get_call_state("CA_claim") is state
+
+
+async def test_timed_out_dial_already_bound_by_the_relay_needs_no_lookup(voice):
+    """Answered inside the request timeout → the SID is already known."""
+
+    class AnsweredThenTimedOut:
+        async def create_async(self, **kwargs: Any) -> Any:
+            await voice.server._resolve_setup_state("CA_bound", "+1000", "outbound-api", to=TARGET, verified=True)
+            raise TimeoutError
+
+        async def list_async(self, **kwargs: Any) -> list[Any]:
+            raise AssertionError("the relay already bound the call; no lookup needed")
+
+    voice.server._engine = voice.engine
+    voice.engine._rest._client = types.SimpleNamespace(calls=AnsweredThenTimedOut())
+
+    result = await outbound.make_phone_call(TARGET, TASK, context={"user_id": "u1"})
+    assert "Call SID: CA_bound" in result
+    state = voice.engine.get_call_state("CA_bound")
+    assert state is not None and state.purpose == TASK
+    assert status_notify.get_call_info("CA_bound") is not None
+    assert sum(outbound._daily_outbound_counts["u1"].values()) == 1
+
+
+async def test_setup_without_a_to_number_does_not_claim(voice):
+    """A setup that names no callee cannot be matched to a pending dial."""
+    briefing = CallBriefing.create(TASK)
+    pre = await voice.engine.register_pending_outbound(briefing, TARGET, language="en")
+    assert await voice.engine.claim_pending_outbound("CA_x", "") is None
+    assert await voice.engine.claim_pending_outbound("CA_x", "+4930999999") is None
+    assert voice.engine._pending_outbound == {pre.call_sid: pre}
+
+
+OTHER_TASK = "Ask whether the parcel for order 4711 can be picked up tomorrow morning."
+
+
+async def test_two_pending_dials_to_one_number_are_not_claimed(voice):
+    """The number cannot tell two dials to the same callee apart."""
+    first = await voice.engine.register_pending_outbound(CallBriefing.create(TASK), TARGET, language="en")
+    second = await voice.engine.register_pending_outbound(CallBriefing.create(OTHER_TASK), TARGET, language="en")
+
+    assert await voice.engine.claim_pending_outbound("CA_x", TARGET) is None
+    assert voice.engine._pending_outbound == {first.call_sid: first, second.call_sid: second}
+
+
+async def test_two_pending_dials_each_bind_to_their_own_sid(voice, monkeypatch):
+    """Dial B's callee connects first. Its setup must not take dial A's
+    briefing; it waits for B's own REST return to bind it by SID."""
+    monkeypatch.setattr(voice.server, "SETUP_STATE_WAIT_S", 2.0)
+    voice.server._engine = voice.engine
+    await voice.engine.register_pending_outbound(CallBriefing.create(TASK), TARGET, language="en")
+    second = await voice.engine.register_pending_outbound(CallBriefing.create(OTHER_TASK), TARGET, language="en")
+
+    setup = asyncio.create_task(
+        voice.server._resolve_setup_state("CA_B", "+1000", "outbound-api", to=TARGET, verified=True)
+    )
+    await asyncio.sleep(0)
+    await voice.engine.promote_pending(second, "CA_B")  # B's REST return
+    state = await asyncio.wait_for(setup, timeout=3)
+
+    assert state is not None and state.purpose == OTHER_TASK
+
+
+class _UpgradeSocket(FakeSocket):
+    """A relay socket the real `_authenticate_ws` can inspect."""
+
+    def __init__(self, query: dict[str, str]) -> None:
+        super().__init__()
+        self.headers: dict[str, str] = {}
+        self.query_params = query
+        self.url = types.SimpleNamespace(path="/api/apps/twilio/relay", query="")
+        self.client = None
+        self.state = types.SimpleNamespace()
+
+
+FORGED_SID = "CA" + "f" * 32
+
+
+async def _forged_setup(voice, sock: _UpgradeSocket) -> Any:
+    """Connect through the real auth gate, send a setup naming the callee, and
+    return the call state the setup was bound to (before the socket closes and
+    ends the call)."""
+    relay = asyncio.create_task(voice.server.relay_ws(sock))
+    sock.push(type="setup", callSid=FORGED_SID, direction="outbound-api", to=TARGET, **{"from": "+15550000000"})
+    handled = asyncio.ensure_future(sock.inbox.join())
+    await asyncio.wait([relay, handled], timeout=2, return_when=asyncio.FIRST_COMPLETED)
+    handled.cancel()
+    bound = voice.engine.get_call_state(FORGED_SID)
+    sock.hang_up()
+    await asyncio.wait_for(relay, timeout=2)
+    return bound
+
+
+@pytest.mark.parametrize("why", ["auth_off", "no_token"])
+async def test_an_unverified_setup_cannot_claim_a_pending_dial(voice, monkeypatch, why):
+    """WS auth off, or no token to check against: `callSid` and `to` are
+    whatever the socket says, so naming the callee of a dial in flight must not
+    hand over its briefing."""
+    monkeypatch.setattr(voice.server, "SETUP_STATE_WAIT_S", 0.05)
+    voice.server._engine = voice.engine
+    voice.settings.voice_ws_auth_required = why != "auth_off"
+    if why == "no_token":
+        voice.settings.twilio_auth_token.get_secret_value.return_value = ""
+    pre = await voice.engine.register_pending_outbound(CallBriefing.create(TASK), TARGET, language="en")
+
+    assert await _forged_setup(voice, _UpgradeSocket({})) is None
+    assert voice.engine._pending_outbound == {pre.call_sid: pre}, "the briefing stays with the real dial"
+
+
+async def test_a_verified_setup_still_claims_its_pending_dial(voice):
+    """The same setup over a socket that passed the signed-token check."""
+    from urllib.parse import parse_qsl
+
+    from pincer.voice.webhook_auth import WS_RELAY_PATH, signed_ws_query
+
+    voice.server._engine = voice.engine
+    voice.settings.voice_ws_auth_required = True
+    query = dict(parse_qsl(signed_ws_query(voice.settings, WS_RELAY_PATH).lstrip("?")))
+    await voice.engine.register_pending_outbound(CallBriefing.create(TASK), TARGET, language="en")
+
+    state = await _forged_setup(voice, _UpgradeSocket(query))
+    assert state is not None and state.purpose == TASK
+    assert voice.engine._pending_outbound == {}
+
+
+async def _relay_webhook_setup(voice, *, signed: bool) -> int:
+    import hashlib
+
+    import httpx
+    from fastapi import FastAPI
+
+    from pincer.voice.webhook_auth import compute_signature
+
+    app = FastAPI()
+    app.include_router(voice.server.twilio_router)
+    body = json.dumps(
+        {"type": "setup", "callSid": "CA" + "e" * 32, "direction": "outbound-api", "to": TARGET, "from": "+1555"}
+    ).encode()
+    url = f"http://test/api/apps/twilio/relay-webhook?bodySHA256={hashlib.sha256(body).hexdigest()}"
+    headers = {"content-type": "application/json"}
+    if signed:
+        headers["X-Twilio-Signature"] = compute_signature("token", url, {})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(url, content=body, headers=headers)
+    return response.status_code
+
+
+@pytest.mark.parametrize("why", ["validation_off", "no_token"])
+async def test_an_unverified_relay_webhook_setup_cannot_claim(voice, monkeypatch, why):
+    monkeypatch.setattr(voice.server, "SETUP_STATE_WAIT_S", 0.05)
+    voice.server._engine = voice.engine
+    voice.settings.voice_webhook_validate = why != "validation_off"
+    if why == "no_token":
+        voice.settings.twilio_auth_token.get_secret_value.return_value = ""
+    pre = await voice.engine.register_pending_outbound(CallBriefing.create(TASK), TARGET, language="en")
+
+    assert await _relay_webhook_setup(voice, signed=False) == 200
+    assert voice.engine.get_call_state("CA" + "e" * 32) is None
+    assert voice.engine._pending_outbound == {pre.call_sid: pre}
+
+
+async def test_a_signed_relay_webhook_setup_still_claims(voice):
+    voice.server._engine = voice.engine
+    voice.settings.voice_webhook_validate = True
+    await voice.engine.register_pending_outbound(CallBriefing.create(TASK), TARGET, language="en")
+
+    assert await _relay_webhook_setup(voice, signed=True) == 200
+    state = voice.engine.get_call_state("CA" + "e" * 32)
+    assert state is not None and state.purpose == TASK
 
 
 async def test_promote_pending_is_idempotent(voice):

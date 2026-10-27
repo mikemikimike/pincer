@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from pincer.voice.engine import CallDirection, CallState, VoiceEngine
@@ -16,9 +17,16 @@ class FakeVoiceEngine(VoiceEngine):
         self.spoken: dict[str, list[str]] = {}
         self.sent_flags: dict[str, list[tuple[str, bool]]] = {}  # (text, last) per send
         self.interrupts: dict[str, int] = {}
+        # by_caller=False silences: how many lines had been spoken at each one
+        self.silenced: dict[str, list[int]] = {}
         self.dtmf: dict[str, list[str]] = {}
         self.ended: list[str] = []
         self.transfers: dict[str, list[dict[str, Any]]] = {}  # Sprint 12: <Dial> redirects
+        self.wait_for_turns = True
+        #: When set, send_speech holds the agent "mid-sentence" until released;
+        #: `speech_waiting` fires once something is held.
+        self.speech_blocker: asyncio.Event | None = None
+        self.speech_waiting = asyncio.Event()
 
     @property
     def engine_name(self) -> str:
@@ -42,16 +50,30 @@ class FakeVoiceEngine(VoiceEngine):
 
     async def on_speech_input(self, call_sid: str, text_or_audio: Any) -> None:
         if self._on_speech_callback:
-            await self._on_speech_callback(call_sid, str(text_or_audio))
+            dispatched = await self._on_speech_callback(call_sid, str(text_or_audio))
+            # The real transports hand the utterance off and keep reading; a
+            # scripted conversation waits for each reply instead. Barge-in
+            # tests switch this off to get the production concurrency.
+            # A turn cancelled by call end or barge-in is finished, not failed.
+            if self.wait_for_turns and isinstance(dispatched, asyncio.Task):
+                await asyncio.wait([dispatched])
+                if not dispatched.cancelled() and dispatched.exception() is not None:
+                    raise dispatched.exception()  # type: ignore[misc]
 
     async def send_speech(self, call_sid: str, text_or_audio: Any, *, last: bool = True) -> bool:
         text = str(text_or_audio)
+        if self.speech_blocker is not None and text:
+            self.speech_waiting.set()
+            await self.speech_blocker.wait()
         if text:  # empty last=True closer (CR stream close) is not "speech"
             self.spoken.setdefault(call_sid, []).append(text)
         self.sent_flags.setdefault(call_sid, []).append((text, last))
         return True
 
-    async def interrupt_speech(self, call_sid: str) -> None:
+    async def interrupt_speech(self, call_sid: str, *, by_caller: bool = True) -> None:
+        if not by_caller:
+            self.silenced.setdefault(call_sid, []).append(len(self.spoken.get(call_sid, [])))
+            return
         self.interrupts[call_sid] = self.interrupts.get(call_sid, 0) + 1
 
     async def transfer_call(

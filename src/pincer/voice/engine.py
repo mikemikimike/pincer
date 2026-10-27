@@ -19,6 +19,9 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from pincer.voice.audio import MULAW_BYTES_PER_SECOND
+from pincer.voice.twilio_rest import TwilioRest
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -59,6 +62,25 @@ END_CODE_KEY = "end_code"
 #: Metadata key for the provider status that set `end_code`, when one did: the
 #: report wording can be more specific than the code (`canceled` vs `failed`).
 PROVIDER_STATUS_KEY = "provider_status"
+#: Metadata key on a pending outbound state: the CallSid a relay `setup`
+#: claimed it as (see `claim_pending_outbound`). The dialer branches on this,
+#: not on a live lookup — a claimed call may already be over.
+CLAIMED_SID_KEY = "claimed_sid"
+
+_ULAW_NS_PER_BYTE = 1_000_000_000 // MULAW_BYTES_PER_SECOND
+
+# Per-utterance STT stamps left in call metadata (Media Streams). Cleared once
+# the utterance is handed off; the channel snapshots the same keys first.
+UTTERANCE_MARKERS = ("speech_end_ns", "speech_start_ns", "first_partial_ns")
+
+# Media Streams barge-in: a VAD onset this soon after our audio started is
+# ignored — line echo of our own first syllable, or the TTS onset click.
+BARGE_IN_ARM_DELAY_MS = 250
+# A VAD onset alone never stops the agent: a cough or a line click fires
+# SpeechStarted too, and cancelling the turn on one drops the reply for good.
+# Recognised words within this window confirm it — any number of words, which
+# is what the onset buys over `interim` and its min-words threshold.
+BARGE_IN_CONFIRM_WINDOW_MS = 1500
 
 # How long a torn-down call stays recognisable to late status webhooks. Twilio
 # retries a status callback for minutes, so this outlives the post-call
@@ -125,6 +147,11 @@ class _SpeechProgress:
     #: Failed synthesis attempts so far. Spans are keyed on it so a resumed
     #: retry shows up as its own bar rather than silently extending the first.
     attempts: int = 0
+    #: The call's speech epoch when the utterance started. A barge-in bumps
+    #: the epoch, which stops this utterance (and only this call's) mid-stream.
+    epoch: int = 0
+    #: A barge-in stopped the utterance before all of it was sent.
+    cut: bool = False
 
 
 class VoiceEngine(ABC):
@@ -143,6 +170,9 @@ class VoiceEngine(ABC):
         # receptionist session) the moment a call is registered, not on the
         # first caller utterance.
         self._on_call_start_callback: Callable | None = None
+        # The caller talked over the agent: lets the channel cancel the turn
+        # that is speaking. See on_caller_barge_in().
+        self._on_barge_in_callback: Callable | None = None
         # Outbound calls briefed and registered BEFORE the Twilio REST dial,
         # keyed by a temporary id until the real CallSid comes back. See
         # register_pending_outbound().
@@ -151,6 +181,8 @@ class VoiceEngine(ABC):
         self._ended_calls: dict[str, float] = {}
         # Optional VoiceMetricsRegistry, injected by VoiceChannel.set_engine
         self.metrics_registry: Any = None
+        # Hangup, transfer, DTMF, fallback <Say>: awaited, never blocking the loop.
+        self._rest = TwilioRest(settings)
 
     def set_on_speech(self, callback: Callable) -> None:
         self._on_speech_callback = callback
@@ -160,6 +192,22 @@ class VoiceEngine(ABC):
 
     def set_on_call_start(self, callback: Callable) -> None:
         self._on_call_start_callback = callback
+
+    def set_on_barge_in(self, callback: Callable) -> None:
+        self._on_barge_in_callback = callback
+
+    async def on_caller_barge_in(self, call_sid: str, heard: str | None = None) -> None:
+        """The caller started speaking over the agent.
+
+        The channel cancels the in-flight turn and calls `interrupt_speech`
+        once; with no channel wired, the audio is at least silenced. `heard` is
+        what the provider reports the caller heard before cutting in, when it
+        reports that (ConversationRelay); None when it does not.
+        """
+        if self._on_barge_in_callback:
+            await self._on_barge_in_callback(call_sid, heard)
+        else:
+            await self.interrupt_speech(call_sid)
 
     @abstractmethod
     async def on_call_start(
@@ -189,9 +237,17 @@ class VoiceEngine(ABC):
         ...
 
     @abstractmethod
-    async def interrupt_speech(self, call_sid: str) -> None: ...
+    async def interrupt_speech(self, call_sid: str, *, by_caller: bool = True) -> None:
+        """Silence the agent. ``by_caller=False`` is our own cut (shutdown):
+        the audio stops, but no caller interruption is counted."""
 
-    @abstractmethod
+    async def wait_for_playout(self, call_sid: str) -> None:
+        """Return once the speech already sent for the call has been heard.
+        `send_speech` returning means Twilio HAS the audio, not that the
+        caller heard it. Engines that hand Twilio text have nothing to wait
+        for; Media Streams sleeps out its playout estimate."""
+        return None
+
     async def transfer_call(
         self,
         call_sid: str,
@@ -201,13 +257,54 @@ class VoiceEngine(ABC):
         action_url: str = "",
         announce: str = "",
         language: str = "",
-    ) -> None: ...
+    ) -> None:
+        """Redirect the live call into <Dial>. With ``action_url`` (Sprint 12
+        receptionist) Twilio reports the dial result there, so a busy / no-answer
+        target can fall back to message-taking instead of dropping the caller."""
+        # the media socket closes on the <Dial> redirect; that is not a hangup
+        live = self._active_calls.get(call_sid)
+        if live is not None:
+            live.metadata["transferring"] = True
+        try:
+            twiml = build_dial_twiml(
+                target_number, timeout_s=timeout_s, action_url=action_url, announce=announce, language=language
+            )
+            await self._rest.update_call(call_sid, twiml=twiml)
+            logger.info("Call %s transferred to %s", call_sid, target_number)
+        except Exception:
+            logger.exception("Transfer failed for call %s", call_sid)
+            raise
 
-    @abstractmethod
-    async def end_call(self, call_sid: str) -> None: ...
+    async def end_call(self, call_sid: str) -> None:
+        try:
+            await self._rest.update_call(call_sid, status="completed")
+        except Exception:
+            logger.exception("Failed to end call %s", call_sid)
+        finally:
+            state = await self._unregister_call(call_sid)
+            if state and self._on_call_end_callback:
+                await self._on_call_end_callback(call_sid, state)
 
-    @abstractmethod
-    async def send_dtmf(self, call_sid: str, digits: str) -> None: ...
+    async def send_dtmf(self, call_sid: str, digits: str) -> None:
+        try:
+            twiml = f'<Response><Play digits="{digits}"/></Response>'
+            await self._rest.update_call(call_sid, twiml=twiml)
+            logger.info("DTMF sent [%s]: %s", call_sid, digits)
+        except Exception:
+            logger.exception("DTMF failed for call %s", call_sid)
+            raise
+
+    async def create_call(self, **kwargs: Any) -> Any:
+        """Place an outbound call on this engine's REST session."""
+        return await self._rest.create_call(**kwargs)
+
+    async def find_call(self, *, to: str, from_: str, since: datetime) -> Any | None:
+        """Look up a call whose `create_call` timed out (TwilioRest.find_call)."""
+        return await self._rest.find_call(to=to, from_=from_, since=since)
+
+    async def aclose(self) -> None:
+        """Release the Twilio REST session (VoiceChannel.stop)."""
+        await self._rest.aclose()
 
     def get_call_state(self, call_sid: str) -> CallState | None:
         return self._active_calls.get(call_sid)
@@ -249,14 +346,8 @@ class VoiceEngine(ABC):
 
         apology = get_prompt("TTS_FAILURE_GOODBYE", state.language, de_formality(self._settings))
         try:
-            from twilio.rest import Client
-
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
             twiml = f'<Response><Say language="{relay_language(state.language)}">{apology}</Say><Hangup/></Response>'
-            client.calls(call_sid).update(twiml=twiml)
+            await self._rest.update_call(call_sid, twiml=twiml)
         except Exception:
             logger.exception("TTS fallback <Say> failed [%s] — ending call directly", call_sid)
             with contextlib.suppress(Exception):
@@ -387,6 +478,42 @@ class VoiceEngine(ABC):
                 await self._on_call_start_callback(call_sid, state)
             except Exception:
                 logger.exception("on_call_start callback failed [%s]", call_sid)
+        return state
+
+    async def claim_pending_outbound(self, call_sid: str, target_number: str) -> CallState | None:
+        """Bind a relay `setup` to the pending dial it belongs to, by callee number.
+
+        Twilio can connect the callee before it has even answered the REST
+        POST: the dial is still awaited in make_phone_call, the CallSid is not
+        known on our side, and promote_pending() cannot run yet. The `to` of
+        the setup message is the one key both sides share before that, so the
+        setup claims the pending dial to that number and promotes it itself —
+        only when exactly one is pending; with several it cannot tell them
+        apart. The later REST return (or lookup) then finds the promotion
+        already done. Telemetry is re-keyed here for the same reason: the
+        answer/media events for the real SID follow immediately.
+        """
+        number = str(target_number or "").strip()
+        if not call_sid or not number:
+            return None
+        matches = [pending for pending in self._pending_outbound.values() if pending.target_number == number]
+        if len(matches) != 1:
+            if matches:
+                # Two dials to one callee (a double request, a retry next to a
+                # chat request): the number cannot say which this setup is,
+                # and a wrong guess runs each call with the other's task. The
+                # REST return binds each one by its own SID instead.
+                logger.warning("%d pending dials to %s — setup %s not claimed", len(matches), number, call_sid)
+            return None
+        pending = matches[0]
+        pending_key = pending.call_sid
+        pending.metadata[CLAIMED_SID_KEY] = call_sid
+        state = await self.promote_pending(pending, call_sid)
+        if state is not None:
+            from pincer.voice.telemetry import hooks as telemetry
+
+            telemetry.dial_accepted(pending_key, call_sid)
+            logger.info("Relay setup claimed pending outbound %s as %s", pending_key, call_sid)
         return state
 
     def discard_pending(self, pre_state: CallState) -> None:
@@ -629,10 +756,15 @@ class ConversationRelayEngine(VoiceEngine):
         logger.info("CR speech output [%s] delivered=%s: %s", call_sid, delivered, text[:80])
         return delivered
 
-    async def interrupt_speech(self, call_sid: str) -> None:
-        # ConversationRelay handles barge-in natively; its "interrupt" message
-        # is informational. Sending Media-Streams-style {"type": "clear"} here
-        # is an invalid CR message (Twilio error 64107) — nothing to send.
+    async def interrupt_speech(self, call_sid: str, *, by_caller: bool = True) -> None:
+        # ConversationRelay stops its own playback on barge-in; the channel
+        # cancels the turn behind it. Sending Media-Streams-style
+        # {"type": "clear"} here is an invalid CR message (Twilio error
+        # 64107) — nothing to send.
+        # Our own cut (shutdown) has nothing to send either: CR cannot drop
+        # text it was given, and the cancelled turn closes its open utterance.
+        if not by_caller:
+            return
         # The count is exact on both engines even though the timing is not.
         from pincer.voice.analytics import get_accumulator
         from pincer.voice.telemetry import hooks as telemetry
@@ -645,71 +777,6 @@ class ConversationRelayEngine(VoiceEngine):
         # `Unavailable` on this engine.
         telemetry.interruption_reported(call_sid, engine="conversation_relay")
         logger.debug("CR interrupt [%s]", call_sid)
-
-    async def transfer_call(
-        self,
-        call_sid: str,
-        target_number: str,
-        *,
-        timeout_s: int = 30,
-        action_url: str = "",
-        announce: str = "",
-        language: str = "",
-    ) -> None:
-        """Redirect the live call into <Dial>. With ``action_url`` (Sprint 12
-        receptionist) Twilio reports the dial result there, so a busy / no-answer
-        target can fall back to message-taking instead of dropping the caller."""
-        # the media socket closes on the <Dial> redirect; that is not a hangup
-        live = self._active_calls.get(call_sid)
-        if live is not None:
-            live.metadata["transferring"] = True
-        try:
-            from twilio.rest import Client
-
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
-            call = client.calls(call_sid)
-            twiml = build_dial_twiml(
-                target_number, timeout_s=timeout_s, action_url=action_url, announce=announce, language=language
-            )
-            call.update(twiml=twiml)
-            logger.info("Call %s transferred to %s", call_sid, target_number)
-        except Exception:
-            logger.exception("Transfer failed for call %s", call_sid)
-            raise
-
-    async def end_call(self, call_sid: str) -> None:
-        try:
-            from twilio.rest import Client
-
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
-            client.calls(call_sid).update(status="completed")
-        except Exception:
-            logger.exception("Failed to end call %s", call_sid)
-        finally:
-            state = await self._unregister_call(call_sid)
-            if state and self._on_call_end_callback:
-                await self._on_call_end_callback(call_sid, state)
-
-    async def send_dtmf(self, call_sid: str, digits: str) -> None:
-        try:
-            from twilio.rest import Client
-
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
-            twiml = f'<Response><Play digits="{digits}"/></Response>'
-            client.calls(call_sid).update(twiml=twiml)
-            logger.info("DTMF sent [%s]: %s", call_sid, digits)
-        except Exception:
-            logger.exception("DTMF failed for call %s", call_sid)
-            raise
 
     async def close_media_stream(self, call_sid: str) -> None:
         """No-op for ConversationRelay; MediaStreamEngine overrides."""
@@ -727,7 +794,6 @@ class MediaStreamEngine(VoiceEngine):
         super().__init__(settings)
         self._stt_provider = None
         self._tts_provider = None
-        self._barge_in_controller = None
 
     @property
     def engine_name(self) -> str:
@@ -800,6 +866,18 @@ class MediaStreamEngine(VoiceEngine):
         from pincer.voice.stt import stt_config_for_language
 
         config = stt_config_for_language(state.language, self._settings)
+        # Both STT encodings assume Twilio's mu-law 8 kHz mono source (linear16
+        # only upsamples it). A <Stream> configured otherwise would feed
+        # Deepgram audio it misreads — say so instead of transcribing noise.
+        media_format = state.metadata.get("media_format") or {}
+        if media_format and (
+            media_format.get("encoding"),
+            media_format.get("sampleRate"),
+            media_format.get("channels"),
+        ) != ("audio/x-mulaw", 8000, 1):
+            logger.warning(
+                "Media Streams format %s is not mu-law 8 kHz mono; STT expects it [%s]", media_format, call_sid
+            )
         from pincer.voice.telemetry.clock import mono_ns as _mono_ns
 
         stt_started_ns = _mono_ns()
@@ -810,13 +888,81 @@ class MediaStreamEngine(VoiceEngine):
         # what turns "the caller stopped talking at 4.12 s" into a stamp on the
         # same clock every other stage is measured on.
         state.metadata["stt_started_ns"] = stt_started_ns
+        # what on_speech_input puts on the wire; re-derived from settings on a
+        # reconnect (_recover_stt_stream calls back in here)
+        state.metadata["stt_encoding"] = config.encoding
         state.metadata["stt_endpointing_ms"] = float(config.endpointing)
         state.metadata["stt_utterance_end_ms"] = float(config.utterance_end_ms)
+
+        # Both constrained by Settings (pattern / ge=1); a bad value fails there.
+        trigger = self._settings.voice_barge_in_trigger
+        min_words = self._settings.voice_barge_in_min_words
+
+        def _agent_audible() -> bool:
+            return _mono_ns() < int(state.metadata.get("playout_until_ns", 0))
+
+        def _armed() -> bool:
+            started = int(state.metadata.get("playout_started_ns", 0))
+            return (_mono_ns() - started) >= BARGE_IN_ARM_DELAY_MS * 1_000_000
+
+        def _echo_of_our_onset(transcript: Any) -> bool:
+            # The same guard for recognised words, judged by when the speech
+            # began rather than when the transcript arrived: Deepgram reports
+            # an interim a few hundred ms after the audio, so an echo of our
+            # first syllable would almost always arrive "armed". Speech that
+            # began before our audio did cannot be its echo, and neither can
+            # speech that goes on past the window: an echo is one or two
+            # words at our onset, while a caller who started talking at the
+            # same moment as us keeps producing words. Every interim of that
+            # utterance shares the same first word, so the first word alone
+            # would mute the caller for the whole reply.
+            started = int(state.metadata.get("playout_started_ns", 0))
+            window_end = started + BARGE_IN_ARM_DELAY_MS * 1_000_000
+            words = list(getattr(transcript, "words", None) or [])
+            if not words:
+                return started <= _mono_ns() < window_end
+            stt_started = int(state.metadata.get("stt_started_ns", 0))
+            return all(started <= stt_started + word.start * 1_000_000_000 < window_end for word in words)
+
+        def _vad_onset_confirmed(transcript: Any) -> bool:
+            # The onset lives for one reply: a final pops it, and so does the
+            # next reply's first chunk (see _stream_tts). Within the reply it
+            # survives a new stretch of audio — a caller who said "Stop" during
+            # sentence 1 still stops sentence 2. What it must not confirm is
+            # the echo of that new stretch's first syllable: such an interim
+            # leaves the onset in place for the caller's real words.
+            onset = int(state.metadata.get("vad_onset_ns", 0))
+            if not onset:
+                return False
+            if (_mono_ns() - onset) > BARGE_IN_CONFIRM_WINDOW_MS * 1_000_000:
+                state.metadata.pop("vad_onset_ns", None)
+                return False
+            if _echo_of_our_onset(transcript):
+                return False
+            state.metadata.pop("vad_onset_ns", None)
+            return True
+
+        async def _cancel_reask() -> None:
+            task = state.metadata.pop("aux_speech_task", None)
+            if task is None:
+                return
+            if not task.done():
+                task.cancel()
+            # Cancelling stops only what is left to synthesize. Audio the re-ask
+            # already sent sits in Twilio's buffer and would play ahead of the
+            # reply; with no turn in flight, nothing else clears it.
+            if _agent_audible():
+                try:
+                    await self.interrupt_speech(call_sid)
+                except Exception:
+                    logger.exception("Clearing the re-ask failed [%s]", call_sid)
 
         async def _handle_final_transcript(transcript: Any) -> None:
             text = transcript.text.strip()
             if not text or not self._on_speech_callback:
                 return
+            # The caller said something new: a re-ask still playing is moot.
+            await _cancel_reask()
             state.mark_caller_spoke()
             # Deepgram word timings are real measurements of when the caller
             # spoke, which is what makes this engine's talk time `exact`.
@@ -856,22 +1002,78 @@ class MediaStreamEngine(VoiceEngine):
                 from pincer.voice.language import de_formality
                 from pincer.voice.prompts import get_prompt
 
-                await self.send_speech(
-                    call_sid,
-                    get_prompt("LOW_CONFIDENCE_REPLY", state.language, de_formality(self._settings)),
+                # A task, not awaited: the consumer has to keep reading (and
+                # detecting barge-in) while the re-ask plays. The next final
+                # transcript cancels it, so it never plays over the next reply.
+                state.metadata["aux_speech_task"] = asyncio.create_task(
+                    self.send_speech(
+                        call_sid,
+                        get_prompt("LOW_CONFIDENCE_REPLY", state.language, de_formality(self._settings)),
+                    ),
+                    name=f"voice-reask-{call_sid}",
                 )
                 return
             state.metadata["low_confidence_count"] = 0
             await self._on_speech_callback(call_sid, text)
             # Per-utterance markers are consumed by the turn that just started;
             # leaving them would date the NEXT turn from this utterance.
-            for marker in ("speech_end_ns", "speech_start_ns", "first_partial_ns"):
+            for marker in UTTERANCE_MARKERS:
                 state.metadata.pop(marker, None)
+
+        async def _barge_in(transcript: Any, source: str) -> None:
+            # One barge-in per stretch of agent audio; interrupt_speech resets
+            # the playout estimate too, this only guards the window before it.
+            state.metadata["playout_until_ns"] = 0
+            state.metadata["barge_in_source"] = source
+            # Speech onset: when SpeechStarted reached us, else Deepgram's word
+            # timing (same anchoring as speech_end_ns), else detection time.
+            words = list(getattr(transcript, "words", None) or [])
+            onset_ns = int(state.metadata.pop("caller_onset_ns", 0))
+            if onset_ns < int(state.metadata.get("playout_started_ns", 0)):
+                onset_ns = 0  # an onset from before this audio began is an older utterance's
+            if not onset_ns and words:
+                onset_ns = int(state.metadata.get("stt_started_ns", 0) + words[0].start * 1_000_000_000)
+            onset_ns = onset_ns or _mono_ns()
+            logger.info("Barge-in detected [%s] via %s", call_sid, source)
+            try:
+                await self.on_caller_barge_in(call_sid)
+            except Exception:
+                # Never let it reach the consumer's handler: that one restarts STT.
+                logger.exception("Barge-in handling failed [%s]", call_sid)
+                return
+            metrics = self.metrics_registry.get(call_sid) if self.metrics_registry else None
+            if metrics:
+                metrics.record_barge_in_reaction(max(0.0, (_mono_ns() - onset_ns) / 1_000_000.0))
 
         async def _consume_transcripts() -> None:
             try:
                 async for transcript in stt_stream.receive_transcripts():
+                    # Barge-in: the caller talking while our audio is still
+                    # playing. VAD onset is the fast trigger; recognised words
+                    # are the confirmation (and the only one in "interim" mode,
+                    # for lines where VAD reacts to noise or echo).
+                    if getattr(transcript, "speech_started", False):
+                        state.metadata["caller_onset_ns"] = _mono_ns()
+                        if trigger == "vad" and _agent_audible() and _armed():
+                            # A candidate only, confirmed by the words below.
+                            state.metadata["vad_onset_ns"] = _mono_ns()
+                        continue
+                    if transcript.text and trigger != "off" and _agent_audible():
+                        if _vad_onset_confirmed(transcript):
+                            # VAD already placed the onset; any recognised word
+                            # confirms it, so min_words deliberately does not apply.
+                            await _barge_in(transcript, "vad")
+                        elif len(transcript.words or transcript.text.split()) >= min_words and not _echo_of_our_onset(
+                            transcript
+                        ):
+                            await _barge_in(transcript, "interim")
                     if transcript.is_final:
+                        # The utterance the onset belonged to is over (UtteranceEnd
+                        # arrives as an empty final); it must not confirm a later one.
+                        state.metadata.pop("vad_onset_ns", None)
+                        if transcript.text:
+                            # Whatever we say next is a new reply to it.
+                            state.metadata["new_reply_pending"] = True
                         await _handle_final_transcript(transcript)
                     elif transcript.text and "first_partial_ns" not in state.metadata:
                         # Interim results are not acted on, but the FIRST one
@@ -924,8 +1126,11 @@ class MediaStreamEngine(VoiceEngine):
     async def on_speech_input(self, call_sid: str, text_or_audio: Any) -> None:
         """Process raw audio from Media Streams WebSocket.
 
-        Twilio sends base64-encoded mu-law 8kHz. We decode, convert to PCM 16kHz,
-        and send to Deepgram STT.
+        Twilio sends base64-encoded mu-law 8kHz, which Deepgram ingests as-is
+        (the stream is opened with encoding=mulaw, see setup_media_stream_stt).
+        Decoding to PCM16 16 kHz in Python cost ~90 µs per 20 ms frame on the
+        event loop and 4x the bytes upstream; it now only runs on the legacy
+        voice_stt_encoding=linear16 path.
         """
         state = self._active_calls.get(call_sid)
         if not state:
@@ -942,13 +1147,14 @@ class MediaStreamEngine(VoiceEngine):
         if not raw:
             return
 
-        from pincer.voice.audio import mulaw8k_to_pcm16k
-
-        pcm_16k = mulaw8k_to_pcm16k(raw)
-
         stt_stream = state.metadata.get("stt_stream")
-        if stt_stream:
-            await stt_stream.send_audio(pcm_16k)
+        if stt_stream is None:
+            return
+        if state.metadata.get("stt_encoding", "mulaw") == "linear16":
+            from pincer.voice.audio import mulaw8k_to_pcm16k
+
+            raw = mulaw8k_to_pcm16k(raw)
+        await stt_stream.send_audio(raw)
 
     async def _clear_twilio_buffer(self, state: CallState) -> None:
         """Drop whatever Twilio still has buffered for playout.
@@ -993,10 +1199,30 @@ class MediaStreamEngine(VoiceEngine):
         segments = split_into_segments(text)
         if not segments:
             return False
-        progress = _SpeechProgress()
+        progress = _SpeechProgress(epoch=int(state.metadata.get("speech_epoch", 0)))
 
         try:
-            delivered = await self._stream_tts(call_sid, state, segments, progress)
+            delivered = await self._synthesize_with_retry(call_sid, state, segments, progress)
+        except asyncio.CancelledError:
+            # The turn was cancelled mid-utterance. The channel logs the line
+            # as cut off only if any of it reached Twilio.
+            state.metadata["last_speech_cut"] = progress.wrote_audio
+            raise
+        if not delivered:
+            return False
+
+        # Read by the channel right after this returns: a cut utterance was
+        # only partly heard, which "delivered" alone cannot say.
+        state.metadata["last_speech_cut"] = progress.cut
+        logger.info("MS speech output [%s] delivered=True cut=%s: %s", call_sid, progress.cut, text[:80])
+        return True
+
+    async def _synthesize_with_retry(
+        self, call_sid: str, state: CallState, segments: list[str], progress: _SpeechProgress
+    ) -> bool:
+        """One utterance through `_stream_tts`, resumed once after a TTS failure."""
+        try:
+            return await self._stream_tts(call_sid, state, segments, progress)
         except Exception:
             from pincer.voice.telemetry import hooks as telemetry
 
@@ -1018,16 +1244,11 @@ class MediaStreamEngine(VoiceEngine):
                 len(segments),
             )
             try:
-                delivered = await self._stream_tts(call_sid, state, segments, progress)
+                return await self._stream_tts(call_sid, state, segments, progress)
             except Exception:
                 logger.exception("TTS retry failed [%s] — spoken fallback + hangup", call_sid)
                 await self.fallback_and_end(call_sid)
                 return False
-        if not delivered:
-            return False
-
-        logger.info("MS speech output [%s] delivered=True: %s", call_sid, text[:80])
-        return True
 
     async def _stream_tts(
         self,
@@ -1071,8 +1292,25 @@ class MediaStreamEngine(VoiceEngine):
 
         turn = current_turn_tracer()
 
+        from pincer.voice.telemetry.clock import mono_ns as _mono_ns
+
+        def interrupted() -> bool:
+            return int(state.metadata.get("speech_epoch", 0)) != progress.epoch
+
+        def bill(segment: str) -> None:
+            # ElevenLabs bills the characters requested, not the audio we kept,
+            # so a segment cut or cancelled mid-stream is still charged in full.
+            state.metadata["tts_characters"] = int(state.metadata.get("tts_characters", 0)) + len(segment)
+            if metrics:
+                metrics.record_tts_characters(len(segment))
+
         started = time.monotonic()
         for index in range(progress.segments_done, len(segments)):
+            if interrupted():
+                # Barge-in between segments: interrupt_speech cleared what
+                # Twilio buffered, and no further segment may start.
+                progress.cut = True
+                return progress.wrote_audio
             segment = segments[index]
             # One span per segment AND per attempt: a resumed retry is a second
             # synthesis of that segment and reads as one on the waterfall.
@@ -1090,49 +1328,83 @@ class MediaStreamEngine(VoiceEngine):
             )
             if turn is not None and index == progress.segments_done:
                 turn.stamp(EventName.TTS_REQUEST, provider="elevenlabs", model=tts_model)
-            async for audio_chunk in self._tts_provider.synthesize_stream(segment, voice=voice_id, model=tts_model):
-                if progress.first_chunk_ms is None:
-                    # Measured once for the utterance: playout begins when
-                    # Twilio receives the first chunk, whichever attempt sent it.
-                    progress.first_chunk_ms = (time.monotonic() - started) * 1000.0
-                    if accumulator is not None:
-                        accumulator.agent_audio_begin()
-                    if metrics:
-                        metrics.record_tts_first_chunk(progress.first_chunk_ms)
-                    if turn is not None:
-                        turn.stamp(EventName.TTS_FIRST_AUDIO, first_chunk_ms=round(progress.first_chunk_ms, 1))
-                        turn.stamp(EventName.AUDIO_QUEUED, kind="audio")
-                mulaw_data = audio_chunk
-                if needs_resample:
-                    from pincer.voice.audio import pcm16k_to_mulaw8k
+            # aclosing: leaving the loop early (barge-in) closes the synthesis
+            # stream now, not whenever the generator is garbage-collected.
+            cut = False
+            try:
+                async with contextlib.aclosing(
+                    self._tts_provider.synthesize_stream(segment, voice=voice_id, model=tts_model)
+                ) as audio_stream:
+                    async for audio_chunk in audio_stream:
+                        if interrupted():
+                            cut = True
+                            break
+                        if progress.first_chunk_ms is None:
+                            # Measured once for the utterance: playout begins when
+                            # Twilio receives the first chunk, whichever attempt sent it.
+                            progress.first_chunk_ms = (time.monotonic() - started) * 1000.0
+                            if accumulator is not None:
+                                accumulator.agent_audio_begin()
+                            if metrics:
+                                metrics.record_tts_first_chunk(progress.first_chunk_ms)
+                            if turn is not None:
+                                turn.stamp(EventName.TTS_FIRST_AUDIO, first_chunk_ms=round(progress.first_chunk_ms, 1))
+                                turn.stamp(EventName.AUDIO_QUEUED, kind="audio")
+                        mulaw_data = audio_chunk
+                        if needs_resample:
+                            from pincer.voice.audio import pcm16k_to_mulaw8k
 
-                    mulaw_data = pcm16k_to_mulaw8k(audio_chunk)
-                if mulaw_data:
-                    payload = base64.b64encode(mulaw_data).decode("ascii")
-                    msg = json.dumps(
-                        {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": payload},
-                        }
-                    )
-                    await ws.send_text(msg)
-                    if turn is not None and not progress.wrote_audio:
-                        # Written to the provider socket. SENT, not heard: Twilio
-                        # buffers outbound audio and acknowledges nothing.
-                        turn.first_audio(kind="audio", engine="media_streams")
-                    progress.wrote_audio = True
-                if accumulator is not None and mulaw_data:
-                    # μ-law at 8 kHz: one byte is 0.125 ms of audio. This is the
-                    # measurement the `exact` method is named for.
-                    accumulator.agent_audio_bytes(len(mulaw_data))
+                            mulaw_data = pcm16k_to_mulaw8k(audio_chunk)
+                        if mulaw_data:
+                            payload = base64.b64encode(mulaw_data).decode("ascii")
+                            msg = json.dumps(
+                                {
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": payload},
+                                }
+                            )
+                            await ws.send_text(msg)
+                            if turn is not None and not progress.wrote_audio:
+                                # Written to the provider socket. SENT, not heard: Twilio
+                                # buffers outbound audio and acknowledges nothing.
+                                turn.first_audio(kind="audio", engine="media_streams")
+                            progress.wrote_audio = True
+                            state.metadata["audio_since_clear"] = True
+                            if state.metadata.pop("new_reply_pending", False):
+                                # A new reply's first audio: an onset taken
+                                # before it belongs to the old reply.
+                                state.metadata.pop("vad_onset_ns", None)
+                            # Twilio plays out in real time; the end of what it
+                            # holds is what barge-in detection checks against.
+                            now_ns = _mono_ns()
+                            playing_until = int(state.metadata.get("playout_until_ns", 0))
+                            if playing_until <= now_ns:
+                                # A new stretch of agent audio: barge-in arms from here.
+                                state.metadata["playout_started_ns"] = now_ns
+                            state.metadata["playout_until_ns"] = (
+                                max(playing_until, now_ns) + len(mulaw_data) * _ULAW_NS_PER_BYTE
+                            )
+                        if accumulator is not None and mulaw_data:
+                            # μ-law at 8 kHz: one byte is 0.125 ms of audio. This is the
+                            # measurement the `exact` method is named for.
+                            accumulator.agent_audio_bytes(len(mulaw_data))
+            except asyncio.CancelledError:
+                # The turn was cancelled (barge-in) while this segment streamed.
+                bill(segment)
+                raise
+            if cut:
+                # Barge-in mid-segment: the rest of it is never synthesized.
+                progress.cut = True
+                bill(segment)
+                if tts_span is not None:
+                    tts_span.close(SpanStatus.CANCELLED)
+                return progress.wrote_audio
 
             # Charged per segment actually synthesized, so a resumed retry does
             # not bill the segments it skipped (the old whole-utterance retry
             # counted every character twice).
-            state.metadata["tts_characters"] = int(state.metadata.get("tts_characters", 0)) + len(segment)
-            if metrics:
-                metrics.record_tts_characters(len(segment))
+            bill(segment)
             progress.segments_done = index + 1
             if tts_span is not None:
                 tts_span.close(SpanStatus.OK)
@@ -1141,7 +1413,7 @@ class MediaStreamEngine(VoiceEngine):
             turn.stamp(EventName.TTS_DONE, segments=len(segments))
         return progress.wrote_audio
 
-    async def interrupt_speech(self, call_sid: str) -> None:
+    async def interrupt_speech(self, call_sid: str, *, by_caller: bool = True) -> None:
         state = self._active_calls.get(call_sid)
         if not state:
             return
@@ -1151,83 +1423,49 @@ class MediaStreamEngine(VoiceEngine):
         from pincer.voice.analytics import get_accumulator
         from pincer.voice.telemetry import hooks as telemetry
 
+        # One interruption per stretch of agent audio: clearing a re-ask and
+        # the channel's cancel of the prior turn both land here for the same
+        # audio, and only the first of them may count or report it.
+        interrupted = by_caller and bool(state.metadata.pop("audio_since_clear", False))
+        source = str(state.metadata.pop("barge_in_source", "next_utterance"))
         accumulator = get_accumulator(state)
         if accumulator is not None:
             accumulator.agent_audio_cancelled()
-            accumulator.interruption()
+            if interrupted:
+                accumulator.interruption()
 
-        detected_ns = telemetry.interruption_detected(call_sid, engine="media_streams")
-        if self._tts_provider:
-            await self._tts_provider.cancel()
+        detected_ns = (
+            telemetry.interruption_detected(call_sid, engine="media_streams", source=source) if interrupted else None
+        )
+        # Per call, not per provider: bumping the epoch stops this call's
+        # in-flight synthesis at its next chunk (see _stream_tts). The provider
+        # is shared by every call, so cancelling it silenced all of them.
+        state.metadata["speech_epoch"] = int(state.metadata.get("speech_epoch", 0)) + 1
+        state.metadata["playout_until_ns"] = 0
 
         await self._clear_twilio_buffer(state)
-        # Twilio does not acknowledge a `clear`, so this is when WE stopped
-        # sending — audio already in its playout buffer may still be heard.
-        telemetry.buffer_cleared(call_sid, since_ns=detected_ns, acknowledged=False)
+        if interrupted:
+            # Twilio does not acknowledge a `clear`, so this is when WE stopped
+            # sending — audio already in its playout buffer may still be heard.
+            telemetry.buffer_cleared(call_sid, since_ns=detected_ns, acknowledged=False)
 
         logger.debug("MS interrupt [%s]", call_sid)
 
-    async def transfer_call(
-        self,
-        call_sid: str,
-        target_number: str,
-        *,
-        timeout_s: int = 30,
-        action_url: str = "",
-        announce: str = "",
-        language: str = "",
-    ) -> None:
-        # the media socket closes on the <Dial> redirect; that is not a hangup
-        live = self._active_calls.get(call_sid)
-        if live is not None:
-            live.metadata["transferring"] = True
-        try:
-            from twilio.rest import Client
+    async def wait_for_playout(self, call_sid: str) -> None:
+        state = self._active_calls.get(call_sid)
+        if not state:
+            return
+        from pincer.voice.telemetry.clock import mono_ns
 
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
-            twiml = build_dial_twiml(
-                target_number, timeout_s=timeout_s, action_url=action_url, announce=announce, language=language
-            )
-            client.calls(call_sid).update(twiml=twiml)
-            logger.info("Call %s transferred to %s", call_sid, target_number)
-        except Exception:
-            logger.exception("Transfer failed for call %s", call_sid)
-            raise
+        # Audio is written faster than real time; `playout_until_ns` is when
+        # Twilio runs out of it (zero after a `clear`).
+        remaining_ns = int(state.metadata.get("playout_until_ns", 0)) - mono_ns()
+        if remaining_ns > 0:
+            await asyncio.sleep(remaining_ns / 1_000_000_000)
 
     async def end_call(self, call_sid: str) -> None:
         await self.close_media_stream(call_sid)
-        try:
-            from twilio.rest import Client
-
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
-            client.calls(call_sid).update(status="completed")
-        except Exception:
-            logger.exception("Failed to end call %s", call_sid)
-        finally:
-            state = await self._unregister_call(call_sid)
-            if state and self._on_call_end_callback:
-                await self._on_call_end_callback(call_sid, state)
-
-    async def send_dtmf(self, call_sid: str, digits: str) -> None:
-        try:
-            from twilio.rest import Client
-
-            client = Client(
-                self._settings.twilio_account_sid,
-                self._settings.twilio_auth_token.get_secret_value(),
-            )
-            twiml = f'<Response><Play digits="{digits}"/></Response>'
-            client.calls(call_sid).update(twiml=twiml)
-            logger.info("DTMF sent [%s]: %s", call_sid, digits)
-        except Exception:
-            logger.exception("DTMF failed for call %s", call_sid)
-            raise
+        await super().end_call(call_sid)
 
     async def close_media_stream(self, call_sid: str) -> None:
         """Close STT stream and cancel transcript consumer."""
@@ -1236,6 +1474,9 @@ class MediaStreamEngine(VoiceEngine):
             return
         stt_stream = state.metadata.pop("stt_stream", None)
         task = state.metadata.pop("stt_consumer_task", None)
+        reask = state.metadata.pop("aux_speech_task", None)
+        if reask is not None and not reask.done() and reask is not asyncio.current_task():
+            reask.cancel()
         # The consumer task itself may drive call teardown (STT failure path);
         # never cancel-and-await the task we're currently running inside.
         if task and task is not asyncio.current_task():

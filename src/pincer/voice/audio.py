@@ -3,6 +3,13 @@ Audio codec and format conversion utilities for telephony <-> AI model pipeline.
 
 Handles conversions between Twilio's mu-law 8kHz format and the linear PCM
 16kHz format used by STT/TTS providers.
+
+Legacy: nothing here runs on the default path any more. Deepgram ingests
+Twilio's mu-law directly and ElevenLabs streams ulaw_8000. The decode half
+(`mulaw8k_to_pcm16k` and what it uses) serves only voice_stt_encoding=linear16;
+`pcm16k_to_mulaw8k` only the pcm_16000 TTS fallback. Both go when those
+options are removed. Don't optimise these loops: the point is that they
+shouldn't run.
 """
 
 from __future__ import annotations
@@ -13,6 +20,11 @@ import struct
 logger = logging.getLogger(__name__)
 
 # mu-law encoding tables
+# Twilio's Media Streams carry 8-bit μ-law at 8 kHz: one byte is one sample is
+# 0.125 ms of playout. Talk-time analytics and the barge-in playout estimate
+# both stand on this number.
+MULAW_BYTES_PER_SECOND = 8000
+
 _MULAW_BIAS = 0x84
 _MULAW_MAX = 0x7FFF
 _MULAW_CLIP = 32635
@@ -340,7 +352,9 @@ def resample_16k_to_8k(pcm_16k: bytes) -> bytes:
 
 
 def mulaw8k_to_pcm16k(mulaw_data: bytes) -> bytes:
-    """Convert Twilio mu-law 8kHz to linear PCM 16kHz for STT providers."""
+    """Convert Twilio mu-law 8kHz to linear PCM 16kHz for STT providers.
+
+    Legacy: only the voice_stt_encoding=linear16 path calls this."""
     pcm_8k = mulaw_to_pcm16(mulaw_data)
     return resample_8k_to_16k(pcm_8k)
 

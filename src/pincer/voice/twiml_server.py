@@ -7,6 +7,7 @@ Media Streams WebSocket connections, and fallback error handling.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -45,6 +46,11 @@ SETUP_STATE_WAIT_S = 3.0
 # blocked. It does NOT attribute blame; it only says the audio stopped arriving.
 MEDIA_GAP_THRESHOLD_MS = 120.0
 
+# Set on `request.state` / `websocket.state` once the Twilio signature or our
+# WS token was actually checked and passed. A request let through with auth
+# off (or no auth token) never carries it.
+VERIFIED_STATE_ATTR = "twilio_verified"
+
 twilio_router = APIRouter(prefix="/api/apps/twilio", tags=["apps", "twilio"])
 voice_router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -74,11 +80,22 @@ async def _authenticate(request: Request) -> bytes | None:
     """
     body = await request.body()
     try:
-        await verify_http_request(request, body, _settings)
+        verified = await verify_http_request(request, body, _settings)
     except WebhookAuthError as e:
         await audit_rejection(f"twilio_webhook:{request.url.path}", client_ip(request), e.reason)
         return None
+    _mark_verified(request, verified)
     return body
+
+
+def _mark_verified(conn: Request | WebSocket, verified: bool) -> None:
+    with contextlib.suppress(AttributeError):
+        setattr(conn.state, VERIFIED_STATE_ATTR, verified)
+
+
+def _was_verified(conn: Any) -> bool:
+    """Did THIS request pass a real signature / token check (not merely auth off)?"""
+    return getattr(getattr(conn, "state", None), VERIFIED_STATE_ATTR, False) is True
 
 
 def _forbidden() -> Response:
@@ -88,11 +105,12 @@ def _forbidden() -> Response:
 async def _authenticate_ws(websocket: WebSocket, surface: str, path: str) -> bool:
     """Verify a WS upgrade BEFORE accept(); closes the handshake with 403 on failure."""
     try:
-        verify_ws_upgrade(websocket, _settings, path)
+        verified = verify_ws_upgrade(websocket, _settings, path)
     except WebhookAuthError as e:
         await audit_rejection(surface, client_ip(websocket), e.reason)
         await websocket.close(code=1008, reason="Unauthorized")
         return False
+    _mark_verified(websocket, verified)
     return True
 
 
@@ -609,7 +627,12 @@ async def relay_ws(websocket: WebSocket) -> None:
                     state.metadata.pop("transferring", None)
                 if state is None:
                     state = await _resolve_setup_state(
-                        call_sid, caller, str(msg.get("direction", "")), client=client_ip(websocket)
+                        call_sid,
+                        caller,
+                        str(msg.get("direction", "")),
+                        client=client_ip(websocket),
+                        to=str(msg.get("to", "")),
+                        verified=_was_verified(websocket),
                     )
                     if state is None:
                         # Outbound with no retrievable briefing (terminated,
@@ -647,8 +670,12 @@ async def relay_ws(websocket: WebSocket) -> None:
                     await _engine.on_speech_input(call_sid, text)
 
             elif msg_type == "interrupt":
+                # Twilio has already stopped its playback; this cancels the turn
+                # still writing tokens behind it. Reached mid-turn only because
+                # the prompt above hands its turn off instead of awaiting it.
                 if call_sid:
-                    await _engine.interrupt_speech(call_sid)
+                    heard = msg.get("utteranceUntilInterrupt")
+                    await _engine.on_caller_barge_in(call_sid, str(heard) if heard is not None else None)
 
             elif msg_type == "error":
                 logger.error("ConversationRelay error [%s]: %s", call_sid, msg)
@@ -671,21 +698,28 @@ async def relay_ws(websocket: WebSocket) -> None:
             await _media_closed(call_sid)
 
 
-async def _resolve_setup_state(call_sid: str, caller: str, direction: str = "", client: str = "") -> Any:
+async def _resolve_setup_state(
+    call_sid: str, caller: str, direction: str = "", client: str = "", to: str = "", *, verified: bool = False
+) -> Any:
     """The call state a `setup` message belongs to, or None to refuse the call.
 
     Order matters, and each step exists because the previous one can lose a
     briefing:
 
     1. The state registered before the dial (the normal outbound path).
-    2. A short wait — `setup` can arrive before `calls.create()` has even
-       returned, so the promotion may be milliseconds away.
-    3. The status_notify record, which also carries purpose and language.
-    4. Give up. If Twilio told us this is an outbound API call, we return None
+    2. The pending dial to this `to` number, claimed by the setup itself —
+       Twilio can connect the callee before the REST dial has returned, and
+       the dial's request timeout (10 s) is longer than any wait here. Only
+       for a `verified` setup: `to` and `callSid` are socket-supplied, and
+       with auth off anyone who knows the callee's number could take the
+       briefing of a dial in flight. Unverified setups skip to step 3.
+    3. A short wait — the promotion may be milliseconds away.
+    4. The status_notify record, which also carries purpose and language.
+    5. Give up. If Twilio told us this is an outbound API call, we return None
        and the caller hangs up: an outbound call whose briefing cannot be
        found MUST NOT run, because what it runs instead is a generic assistant
        persona on a call the user gave a task to.
-    5. Otherwise refuse: an unknown SID on a voice socket is never a
+    6. Otherwise refuse: an unknown SID on a voice socket is never a
        legitimate Twilio call. Genuine inbound calls are registered by the
        signature-verified /webhook before their TwiML (and hence this socket)
        exists, and genuine outbound calls leave a state or a status record.
@@ -705,7 +739,9 @@ async def _resolve_setup_state(call_sid: str, caller: str, direction: str = "", 
         return state
 
     if is_outbound:
-        state = await _engine.await_call_state(call_sid, timeout=SETUP_STATE_WAIT_S)
+        state = await _engine.claim_pending_outbound(call_sid, to) if verified else None
+        if state is None:
+            state = await _engine.await_call_state(call_sid, timeout=SETUP_STATE_WAIT_S)
         if state is not None:
             return state
 
@@ -871,13 +907,23 @@ async def relay_webhook(request: Request) -> Response:
         if call_sid and not _engine.get_call_state(call_sid):
             # Same resolver as the relay socket, so the briefing rules cannot
             # differ between the two transports.
-            await _resolve_setup_state(call_sid, caller, str(body.get("direction", "")), client=client_ip(request))
+            await _resolve_setup_state(
+                call_sid,
+                caller,
+                str(body.get("direction", "")),
+                client=client_ip(request),
+                to=str(body.get("to", body.get("To", ""))),
+                verified=_was_verified(request),
+            )
         if call_sid:
             await _engine.mark_call_answered(call_sid)
 
     elif event_type == "interrupt":
+        # The same barge-in as the relay socket: cancel the turn still writing
+        # tokens and re-mark what the caller never heard, not just the audio.
         if call_sid:
-            await _engine.interrupt_speech(call_sid)
+            heard = body.get("utteranceUntilInterrupt")
+            await _engine.on_caller_barge_in(call_sid, str(heard) if heard is not None else None)
 
     elif event_type == "error":
         logger.error("ConversationRelay error: %s", body)
@@ -950,6 +996,8 @@ async def media_stream_ws(websocket: WebSocket, call_sid: str) -> None:
                 stream_sid = msg.get("streamSid", "")
                 if state:
                     state.metadata["stream_sid"] = stream_sid
+                    # {"encoding":"audio/x-mulaw","sampleRate":8000,"channels":1}
+                    state.metadata["media_format"] = (msg.get("start") or {}).get("mediaFormat") or {}
                     # Media Streams: set up STT and transcript consumer
                     if hasattr(_engine, "setup_media_stream_stt"):
                         await _engine.setup_media_stream_stt(call_sid, stream_sid)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import UTC, datetime
@@ -13,8 +14,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from pincer.voice import twiml_server
-from pincer.voice.engine import CallDirection, CallState
+from pincer.channels.phone_calls import VoiceChannel
+from pincer.voice import scheduling, twiml_server
+from pincer.voice.engine import CallDirection, CallState, ConversationRelayEngine
+from pincer.voice.transcript import Speaker, TranscriptLogger
 from pincer.voice.webhook_auth import WS_RELAY_PATH, WS_STREAM_PATH, signed_ws_query, ws_token
 
 
@@ -23,6 +26,7 @@ class FakeEngine:
         self.states: dict[str, CallState] = {}
         self.speech_inputs: list[tuple[str, str]] = []
         self.interrupts: list[str] = []
+        self.heard: list[str | None] = []
         self.started: list[tuple[str, str, CallDirection]] = []
         self.fallbacks: list[str] = []
         self.media_closed: list[str] = []
@@ -54,8 +58,9 @@ class FakeEngine:
     async def on_speech_input(self, call_sid: str, text: str) -> None:
         self.speech_inputs.append((call_sid, text))
 
-    async def interrupt_speech(self, call_sid: str) -> None:
+    async def on_caller_barge_in(self, call_sid: str, heard: str | None = None) -> None:
         self.interrupts.append(call_sid)
+        self.heard.append(heard)
 
     def get_active_calls(self) -> dict[str, CallState]:
         return dict(self.states)
@@ -355,6 +360,25 @@ class TestRelayWebSocketAuth:
             ws.send_text(json.dumps({"event": "connected"}))
             ws.send_text(json.dumps({"event": "stop"}))
 
+    def test_start_media_format_is_known_before_stt_setup(self):
+        """setup_media_stream_stt checks Twilio's declared format; it has to
+        be on the state by the time STT is configured."""
+        seen: list[Any] = []
+
+        class StreamEngine(FakeEngine):
+            async def setup_media_stream_stt(self, call_sid: str, stream_sid: str) -> None:
+                seen.append(self.states[call_sid].metadata.get("media_format"))
+
+        engine = StreamEngine()
+        _register(engine, "CA_fmt")
+        client = _app_with_engine(engine)
+        media_format = {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1}
+        with client.websocket_connect(_signed("/api/apps/twilio/stream/CA_fmt", WS_STREAM_PATH)) as ws:
+            ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {"mediaFormat": media_format}}))
+            ws.send_text(json.dumps({"event": "stop"}))
+
+        assert seen == [media_format]
+
     def test_auth_disabled_allows_unsigned_connect(self):
         """Dev escape hatch still works — and doctor reports it CRITICAL."""
         engine = FakeEngine()
@@ -370,3 +394,310 @@ class TestRelayWebSocketAuth:
             ws.send_text(json.dumps({"type": "prompt", "voicePrompt": "hi"}))
         assert engine.answered == ["CA_open"]
         assert ("CA_open", "hi") in engine.speech_inputs
+
+
+# ── Barge-in through the real read loop ─────────────────────────────────────
+#
+# The FakeEngine above returns from on_speech_input at once, so it can never
+# show the socket loop blocked. These drive the production stack —
+# relay_ws → ConversationRelayEngine → VoiceChannel — with a scripted LLM that
+# stalls mid-reply, in the test's own event loop (TestClient runs the app on
+# another thread, where the stall and the interrupt could not be sequenced
+# without sleeping).
+
+OLD_FIRST = "Der erste Satz der alten Antwort."
+OLD_NEVER = "Dieser Satz darf niemals gesprochen werden."
+NEW_REPLY = "Die neue Antwort auf die Unterbrechung."
+
+
+class _Trace:
+    """Turn trace stand-in: records the cancellation, ignores the stamps."""
+
+    def __init__(self) -> None:
+        self.cancelled_with: str | None = None
+
+    def cancel(self, reason: str = "") -> None:
+        self.cancelled_with = self.cancelled_with or reason
+
+    def __getattr__(self, _name: str) -> Any:
+        return lambda *_a, **_k: None
+
+
+@pytest.fixture
+def relay_call(monkeypatch):
+    from test_voice_streaming_turn import FakeStreamAgent, _settings
+    from voice_harness.transport_fakes import FakeSocket, FakeTwilio, install_fake_twilio
+
+    scheduling._reset_for_tests()
+    install_fake_twilio(monkeypatch, FakeTwilio)  # real engine: ending a call would hit Twilio
+
+    async def _authenticated(*_args) -> bool:
+        return True
+
+    async def _start(scripts):
+        settings = _settings()
+        engine = ConversationRelayEngine(settings)
+        channel = VoiceChannel(settings)
+        channel.set_engine(engine)
+        agent = FakeStreamAgent(scripts)
+        channel.set_stream_agent(agent)
+        traces: list[_Trace] = []
+
+        def _open_trace(call_sid, _state, _arrival_ns, _markers=None):
+            traces.append(_Trace())
+            channel._turn_traces[call_sid] = traces[-1]
+            return traces[-1]
+
+        channel._open_turn_trace = _open_trace
+
+        async def _handler(_incoming):
+            return ""
+
+        await channel.start(_handler)
+        monkeypatch.setattr(twiml_server, "_engine", engine)
+        monkeypatch.setattr(twiml_server, "_settings", settings)
+        monkeypatch.setattr(twiml_server, "_authenticate_ws", _authenticated)
+        await engine.on_call_start("CA_cr", "+4930123456", CallDirection.INBOUND, language="de")
+        sock = FakeSocket()
+        loop = asyncio.create_task(twiml_server.relay_ws(sock))
+        sock.push(type="setup", callSid="CA_cr", **{"from": "+4930123456"})
+        return engine, channel, agent, sock, loop, traces
+
+    yield _start
+    scheduling._reset_for_tests()
+
+
+def _scripts():
+    from test_voice_streaming_turn import text_chunks
+
+    return [text_chunks(f"{OLD_FIRST} ", OLD_NEVER), text_chunks(NEW_REPLY)]
+
+
+class TestRelayBargeIn:
+    # regression: fails on dev @ 0a1c320 (the loop never reads the interrupt)
+    async def test_interrupt_is_read_and_cancels_the_paused_turn(self, relay_call):
+        engine, channel, agent, sock, loop, traces = await relay_call(_scripts())
+        agent.pause_after = 1
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(agent.paused.wait(), timeout=2)
+        assert sock.tokens() == [OLD_FIRST]
+
+        # The turn is still running. The read loop must get to this anyway.
+        agent.pause_after = None
+        sock.push(type="interrupt", utteranceUntilInterrupt="Der erste Satz", durationUntilInterruptMs=900)
+        await asyncio.wait_for(sock.inbox.join(), timeout=2)
+        assert traces[0].cancelled_with == "barge_in"  # before the LLM was ever resumed
+        assert "CA_cr" not in channel._active_turns
+
+        sock.push(type="prompt", voicePrompt="Zweite Frage", last=True)
+        await asyncio.wait_for(sock.inbox.join(), timeout=2)
+        await channel.wait_for_turn("CA_cr")
+
+        assert sock.tokens() == [OLD_FIRST, NEW_REPLY]
+        transcript = channel.get_transcript("CA_cr")
+        old_line = next(e for e in transcript.entries if e.speaker == Speaker.AGENT and e.text == OLD_FIRST)
+        assert old_line.state == "interrupted"
+
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+        await channel.stop()
+
+    async def test_an_interrupt_over_the_http_webhook_cancels_the_paused_turn(self, relay_call):
+        """The relay's HTTP transport gets the same barge-in as its socket."""
+        import httpx
+        from fastapi import FastAPI
+
+        engine, channel, agent, sock, loop, traces = await relay_call(_scripts())
+        engine._settings.voice_webhook_validate = False
+        agent.pause_after = 1
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(agent.paused.wait(), timeout=2)
+        agent.pause_after = None
+
+        app = FastAPI()
+        app.include_router(twiml_server.twilio_router)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/api/apps/twilio/relay-webhook",
+                json={"type": "interrupt", "callSid": "CA_cr", "utteranceUntilInterrupt": "Der erste Satz"},
+            )
+        assert response.status_code == 200
+
+        assert traces[0].cancelled_with == "barge_in"
+        assert "CA_cr" not in channel._active_turns
+        old_line = next(e for e in channel.get_transcript("CA_cr").entries if e.text == OLD_FIRST)
+        assert old_line.state == "interrupted"
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+        await channel.stop()
+
+    async def test_the_closing_line_of_a_reply_ends_its_utterance(self, relay_call):
+        engine, channel, agent, sock, loop, _traces = await relay_call([_scripts()[1]])
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(sock.inbox.join(), timeout=2)
+        await channel.wait_for_turn("CA_cr")
+
+        line = next(e for e in channel.get_transcript("CA_cr").entries if e.text == NEW_REPLY)
+        assert line.ends_utterance
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+        await channel.stop()
+
+    async def test_a_failed_turn_closes_its_utterance_before_the_retry_line(self, relay_call):
+        """s1 and s2 streamed, then the LLM dies: the closer ends their
+        utterance and the retry line is its own. A barge-in that names the
+        retry line must leave s1 and s2, which played in full, alone."""
+        from test_voice_streaming_turn import text_chunks
+
+        from pincer.voice.prompts import get_prompt
+
+        second = "Der zweite Satz ist auch noch lang genug."
+        script = text_chunks(f"{OLD_FIRST} ", f"{second} ", "Dieser dritte wird nie gesendet. ")
+        engine, channel, agent, sock, loop, _traces = await relay_call([script])
+        agent.fail_after = 2  # two sentences out (last=False), then the stream raises
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(sock.inbox.join(), timeout=2)
+        await channel.wait_for_turn("CA_cr")
+
+        retry_line = str(get_prompt("BRAIN_ERROR_RETRY", "de", "sie"))
+        texts = [(m["token"], m["last"]) for m in sock.sent if m.get("type") == "text"]
+        assert texts == [(OLD_FIRST, False), (second, False), ("", True), (retry_line, True)]
+        transcript = channel.get_transcript("CA_cr")
+        assert [(e.text, e.ends_utterance) for e in transcript.entries if e.speaker == Speaker.AGENT] == [
+            (OLD_FIRST, False),
+            (second, True),
+            (retry_line, True),
+        ]
+
+        played = _states(transcript)[:2]  # the two streamed sentences, as the turn recorded them
+        transcript.mark_interrupted(retry_line.split()[0])
+        assert _states(transcript) == [*played, "interrupted"]
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+        await channel.stop()
+
+    async def test_shutdown_closes_the_open_utterance_before_the_goodbye(self, relay_call):
+        """The cancelled turn closes its CR utterance; the goodbye never continues it."""
+        engine, channel, agent, sock, loop, _traces = await relay_call(_scripts())
+        agent.pause_after = 1
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(agent.paused.wait(), timeout=2)
+        assert [(m["token"], m["last"]) for m in sock.sent if m.get("type") == "text"] == [(OLD_FIRST, False)]
+
+        await channel.stop()
+
+        texts = [(m["token"], m["last"]) for m in sock.sent if m.get("type") == "text"]
+        assert texts[:2] == [(OLD_FIRST, False), ("", True)]  # closed before the goodbye
+        assert texts[2][0] and texts[2][1]  # the goodbye is its own utterance
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+
+    # regression: fails on dev @ 0a1c320
+    async def test_interrupt_and_the_next_prompt_count_once(self, relay_call):
+        engine, channel, agent, sock, loop, _traces = await relay_call(_scripts())
+        counted: list[str] = []
+        original = engine.interrupt_speech
+
+        async def _counting(call_sid: str) -> None:
+            counted.append(call_sid)
+            await original(call_sid)
+
+        engine.interrupt_speech = _counting
+        agent.pause_after = 1
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(agent.paused.wait(), timeout=2)
+        agent.pause_after = None
+        sock.push(type="interrupt", utteranceUntilInterrupt="")
+        sock.push(type="prompt", voicePrompt="Moment!", last=True)
+        await asyncio.wait_for(sock.inbox.join(), timeout=2)
+        await channel.wait_for_turn("CA_cr")
+
+        assert counted == ["CA_cr"]
+        assert sock.tokens()[-1] == NEW_REPLY
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+        await channel.stop()
+
+    # regression: fails on dev @ 0a1c320 (the hangup is never read mid-turn)
+    async def test_hangup_mid_reply_stops_the_turn(self, relay_call, caplog):
+        engine, channel, agent, sock, loop, traces = await relay_call(_scripts())
+        agent.pause_after = 1
+        sock.push(type="prompt", voicePrompt="Erste Frage?", last=True)
+        await asyncio.wait_for(agent.paused.wait(), timeout=2)
+        turn = channel._active_turns["CA_cr"]
+
+        sock.hang_up()
+        await asyncio.wait_for(loop, timeout=2)
+        await asyncio.wait_for(asyncio.wait([turn]), timeout=2)
+
+        assert turn.cancelled()
+        assert traces[0].cancelled_with == "call_ended"
+        assert not channel._active_turns and not channel._utterance_tasks
+        assert OLD_NEVER not in sock.tokens()
+        assert "DROPPED" not in caplog.text
+        await channel.stop()
+
+
+def _reply(*utterances: list[str]) -> TranscriptLogger:
+    """A caller question, then the agent's reply as provider utterances."""
+    transcript = TranscriptLogger("CA_t")
+    transcript.log_utterance(Speaker.CALLER, "Wann ist mein Termin?")
+    for lines in utterances:
+        for line in lines:
+            transcript.log_utterance(Speaker.AGENT, line, state="freeform")
+        transcript.end_agent_utterance()
+    return transcript
+
+
+def _states(transcript: TranscriptLogger) -> list[str]:
+    return [e.state for e in transcript.entries if e.speaker == Speaker.AGENT]
+
+
+class TestMarkInterrupted:
+    def test_an_earlier_utterance_counts_as_heard(self):
+        """Filler played in full; `heard` covers only the answer being played."""
+        transcript = _reply(["Einen Moment bitte."], ["Der Termin ist am Montag.", "Um zehn Uhr."])
+
+        marked = transcript.mark_interrupted("Der Termin ist am")
+
+        assert _states(transcript) == ["freeform", "interrupted", "undelivered"]
+        assert marked == 2
+
+    def test_heard_lines_of_the_playing_utterance_keep_their_state(self):
+        transcript = _reply(["Einen Moment bitte."], ["Der Termin ist am Montag.", "Um zehn Uhr.", "Passt das?"])
+
+        transcript.mark_interrupted("Der Termin ist am Montag. Um zehn")
+
+        assert _states(transcript) == ["freeform", "freeform", "interrupted", "undelivered"]
+
+    def test_utterances_after_the_playing_one_never_played(self):
+        transcript = _reply(["Einen Moment bitte."], ["Der Termin ist am Montag."])
+
+        transcript.mark_interrupted("Einen Moment")
+
+        assert _states(transcript) == ["interrupted", "undelivered"]
+
+    def test_unmatched_heard_marks_only_the_latest_utterance(self):
+        transcript = _reply(["Einen Moment bitte."], ["Der Termin ist am Montag."])
+
+        transcript.mark_interrupted("")
+
+        assert _states(transcript) == ["freeform", "interrupted"]
+
+    def test_the_latest_utterance_starting_with_heard_is_the_one_playing(self):
+        """A short earlier line is easily a prefix of the line really playing."""
+        transcript = _reply(["Ja."], ["Ja, der Termin ist am Montag."])
+
+        transcript.mark_interrupted("Ja")
+
+        assert _states(transcript) == ["freeform", "interrupted"]
+
+    def test_a_single_open_utterance_is_unchanged(self):
+        transcript = TranscriptLogger("CA_t")
+        transcript.log_utterance(Speaker.CALLER, "Hallo?")
+        transcript.log_utterance(Speaker.AGENT, "Der erste Satz.", state="freeform")
+        transcript.log_utterance(Speaker.AGENT, "Der zweite Satz.", state="freeform")
+
+        transcript.mark_interrupted("Der erste Satz. Der zw")
+
+        assert _states(transcript) == ["freeform", "interrupted"]
