@@ -387,7 +387,14 @@ mounting a directory. Install the new `remote-skills` extra
   brotli 1.2.1, certifi 2026.10.23, dnspython 2.9.0, filelock 4.2.4, fpdf2
   2.8.9, msgpack 1.2.4, pillow 13.0.0 (with fastembed 0.9.1), setuptools
   84.2.1, and the OpenTelemetry family (api/sdk/exporters 1.45.1,
-  instrumentation 0.66b1). anyio stays held at 4.13.0.
+  instrumentation 0.66b1).
+- **The last triaged advisories are cleared; nothing is triaged anymore.**
+  anyio 4.13.0 → 4.15.1 (with typing-extensions 4.16.0): the cancel-scope
+  teardown failure that held it back is gone since the MCP client owns each
+  server's stack in one task (#234). PyNaCl 1.5.0 → 1.6.2 through a uv
+  `override-dependencies` entry, because discord.py 2.7.1's `[voice]` extra
+  still caps it below 1.6. Upstream lifted that cap in a metadata-only commit
+  that isn't released yet; drop the override once a release includes it.
 
 ### Added
 

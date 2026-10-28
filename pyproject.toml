@@ -262,6 +262,13 @@ enable_error_code = [
 exclude_dirs = ["tests", "dashboard"]
 skips = ["B101", "B104", "B310", "B608"]
 
+[tool.uv]
+# discord.py 2.7.1's `[voice]` extra caps PyNaCl <1.6, which pins it to 1.5.0
+# (PYSEC-2026-1448, PYSEC-2026-3002; fixed in 1.6.2). Upstream lifted the cap to
+# `>=1.6.0,<1.7` in Rapptz/discord.py@5d74ed3 as a metadata-only change, but it
+# isn't released yet. Drop this override once a discord.py release includes it.
+override-dependencies = ["pynacl>=1.6.2,<1.7"]
+
 [tool.uv.workspace]
 members = [
     "src/pincer-mcps",
