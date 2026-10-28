@@ -176,6 +176,10 @@ agent code needs a separate uid or container.
 
 ### Added
 
+- `PINCER_VOICE_TRANSFER_MAX_DURATION_S` (default 3600): ceiling for a call
+  transferred to a human (`<Dial timeLimit>`), and the metric
+  `pincer.voice.receptionist.transfers{result=…}`.
+
 #### Google OAuth token from `PINCER_GOOGLE_TOKEN_JSON` (#268)
 
 The Google token no longer has to live in the data volume. Set
@@ -363,6 +367,17 @@ mounting a directory. Install the new `remote-skills` extra
     drained side by side, so the whole drain takes about one goodbye, not one
     per call: one after another, a deploy at load ran out of
     `SHUTDOWN_DRAIN_TIMEOUT_S` and force-ended the last calls with no goodbye.
+- Receptionist transfers to a human were hung up after ~30 s by the phase
+  watchdog; transferred calls are now finalized by Twilio's end signal and
+  reported as transferred. Calls bridged to a human no longer trip the
+  stuck-call page (they still count toward `inbound_max_concurrent`, since a
+  failed transfer reconnects them to the agent), and a `completed` status
+  callback no longer issues a REST hangup on a call Twilio already ended.
+- A receptionist call whose ConversationRelay events arrive over the deprecated
+  HTTP `/relay-webhook` is never transferred to a human: with no media socket,
+  a redirect Twilio did not apply could not be detected and the caller would
+  wait in silence. The caller hears the failed-transfer apology and leaves a
+  message instead; no transfer is recorded.
 
 ### Added
 

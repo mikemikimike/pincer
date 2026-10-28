@@ -264,6 +264,8 @@ class ReceptionSession:
         self.pending_faq = ""
         self.transfer_attempted = False
         self.transfer_failed = False
+        self.transfer_completed = False
+        self.transfer_duration_s: int | None = None
         self.ended = False
         self.end_reason = ""
         self.turns = 0
@@ -310,6 +312,8 @@ class ReceptionSession:
             "booking": self.booking.to_dict(),
             "transfer_attempted": self.transfer_attempted,
             "transfer_failed": self.transfer_failed,
+            "transfer_completed": self.transfer_completed,
+            "transfer_duration_s": self.transfer_duration_s,
             "is_open": self.is_open,
             "language": self.language,
             "turns": self.turns,
@@ -552,6 +556,12 @@ class ReceptionSession:
             if not self.profile.transfer.enabled:
                 self._start_message("message")
                 await self.speak(f"{self.line('human_disabled')} {self.line('ask_name')}")
+                return "", True
+            if self._transfer_refused():
+                # Refused, not failed: no dial is attempted, so nothing records
+                # a transfer; the caller hears the same apology as a failed one.
+                self._start_message("message")
+                await self.speak(f"{self.line('transfer_failed')} {self.line('ask_name')}")
                 return "", True
             await self._transfer()
             return "", True
@@ -1039,6 +1049,16 @@ class ReceptionSession:
 
     # ── TRANSFERRING (§8.4) ───────────────────────────────
 
+    def _transfer_refused(self) -> bool:
+        """No human transfer for a call on the deprecated HTTP /relay-webhook
+        (RELAY_WEBHOOK_KEY): without a media socket a redirect that Twilio did
+        not apply could never be detected, and the caller would wait in silence."""
+        from pincer.voice.engine import RELAY_WEBHOOK_KEY
+
+        state = self.engine.get_call_state(self.call_sid) if self.engine is not None else None
+        metadata = getattr(state, "metadata", None)
+        return isinstance(metadata, dict) and bool(metadata.get(RELAY_WEBHOOK_KEY))
+
     async def _transfer(self) -> None:
         self.transfer_attempted = True
         self._to_phase(CallPhase.TRANSFERRING, "intent_human")
@@ -1063,13 +1083,41 @@ class ReceptionSession:
             self._log_action("transfer", self.profile.transfer.target)
         except Exception:
             logger.exception("Receptionist transfer failed [%s]", self.call_sid)
-            await self.on_transfer_failed()
+            # No <Dial> happened, so there is no reconnect to carry the apology
+            # as its greeting: say it on the live call.
+            await self.speak(await self.on_transfer_failed())
 
-    async def on_transfer_failed(self) -> str:
+    def on_transfer_completed(self, duration_s: int | None) -> None:
+        """The caller talked to the human (DialCallStatus completed/answered, or
+        DialBridged=true). The phase
+        stays TRANSFERRING, which the hangup classification counts as benign."""
+        self.transfer_completed = True
+        self.transfer_duration_s = duration_s
+        self._transfer_result("completed")
+        self._log_action("transfer_completed", self.profile.transfer.target, f"{duration_s}s" if duration_s else "")
+        self._sync()
+
+    def on_transfer_abandoned(self) -> None:
+        """The caller hung up while the target was still ringing: nothing to
+        reconnect, the call is over."""
+        self.transfer_failed = True
+        self.end_reason = "caller_hangup_during_transfer"
+        self._transfer_result("caller_hangup")
+        self._sync()
+
+    def _transfer_result(self, result: str) -> None:
+        try:
+            from pincer.observability.metrics import record_receptionist_transfer
+
+            record_receptionist_transfer(result, language=self.language)
+        except Exception:
+            logger.debug("transfer metric failed", exc_info=True)
+
+    async def on_transfer_failed(self, result: str = "failed") -> str:
         """Dial failed/busy/no-answer (webhook or immediate): apology → TAKE_MESSAGE.
         Returns the text to speak (also used as the re-connect greeting)."""
         self.transfer_failed = True
-        self._metric("transfer_failed")
+        self._transfer_result(result)
         self._to_phase(CallPhase.TAKE_MESSAGE, "transfer_failed")
         self._start_message("message")
         text = f"{self.line('transfer_failed')} {self.line('ask_name')}"

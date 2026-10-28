@@ -13,12 +13,15 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from voice_harness.strict_async import FAIL_ON_UNAWAITED_COROUTINE
 
 from pincer.channels.phone_calls import VoiceChannel
 from pincer.voice import scheduling, twiml_server
-from pincer.voice.engine import CallDirection, CallState, ConversationRelayEngine
+from pincer.voice.engine import CallDirection, CallState, ConversationRelayEngine, VoiceEngine
 from pincer.voice.transcript import Speaker, TranscriptLogger
 from pincer.voice.webhook_auth import WS_RELAY_PATH, WS_STREAM_PATH, signed_ws_query, ws_token
+
+pytestmark = FAIL_ON_UNAWAITED_COROUTINE
 
 
 class FakeEngine:
@@ -30,7 +33,11 @@ class FakeEngine:
         self.started: list[tuple[str, str, CallDirection]] = []
         self.fallbacks: list[str] = []
         self.media_closed: list[str] = []
+        self.stt_closed: list[str] = []  # close_media_stream (Media Streams STT)
         self.answered: list[str] = []
+        # what VoiceEngine.end_transfer reads
+        self._active_calls = self.states
+        self._on_transfer_end_callback: Any = None
 
     async def fallback_and_end(self, call_sid: str) -> None:
         self.fallbacks.append(call_sid)
@@ -64,6 +71,15 @@ class FakeEngine:
 
     def get_active_calls(self) -> dict[str, CallState]:
         return dict(self.states)
+
+    async def fetch_call_status(self, call_sid: str) -> str:
+        return "in-progress"
+
+    # the real implementation, not a copy that can drift from it
+    end_transfer = VoiceEngine.end_transfer
+
+    async def close_media_stream(self, call_sid: str) -> None:
+        self.stt_closed.append(call_sid)
 
     async def on_media_closed(self, call_sid: str) -> None:
         state = self.states.get(call_sid)
@@ -169,6 +185,50 @@ class TestRelayWebSocket:
         assert engine2.media_closed == []
         assert "CA_xfer2" in engine2.states
 
+    def test_relay_setup_after_failed_transfer_marks_reconnected(self):
+        """Twilio executed the reconnect TwiML: from here a replayed dial result
+        must not re-issue <Connect>. An ordinary setup (no transfer) adds nothing."""
+        engine = FakeEngine()
+        back = _register(engine, "CA_back")
+        back.metadata["transfer"] = {"dial_call_sid": "CAdial", "dial_status": "busy"}
+        plain = _register(engine, "CA_plain")
+        client = _app_with_engine(engine)
+        for call_sid in ("CA_back", "CA_plain"):
+            with client.websocket_connect(_signed("/api/apps/twilio/relay")) as ws:
+                ws.send_text(json.dumps({"type": "setup", "callSid": call_sid, "from": "+1"}))
+                ws.send_text(json.dumps({"type": "prompt", "voicePrompt": "hi"}))
+        assert back.metadata["transfer"]["reconnected"] is True
+        assert "transfer" not in plain.metadata
+
+    def test_stream_start_after_failed_transfer_marks_reconnected(self):
+        engine = FakeEngine()
+        back = _register(engine, "CA_back")
+        back.metadata["transfer"] = {"dial_call_sid": "CAdial", "dial_status": "busy"}
+        client = _app_with_engine(engine)
+        with client.websocket_connect(_signed("/api/apps/twilio/stream/CA_back", WS_STREAM_PATH)) as ws:
+            ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1"}))
+            ws.send_text(json.dumps({"event": "stop"}))
+        assert back.metadata["transfer"]["reconnected"] is True
+
+    def test_stream_finally_leaves_a_replacing_socket_alone(self):
+        """A stream socket that was replaced (a new one took over the call)
+        must not clear the new socket's entry when it closes, nor end the call:
+        a transfer would read "media gone" while the caller is still streaming."""
+        engine = FakeEngine()
+        state = _register(engine, "CA_swap")
+        replacing = object()
+        client = _app_with_engine(engine)
+        with client.websocket_connect(_signed("/api/apps/twilio/stream/CA_swap", WS_STREAM_PATH)) as ws:
+            ws.send_text(json.dumps({"event": "media", "media": {"payload": "AAAA"}}))
+            deadline = time.monotonic() + 5
+            while not engine.speech_inputs and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert engine.speech_inputs, "the stream never attached"
+            state.metadata["websocket"] = replacing  # a new socket took over the call
+        assert state.metadata.get("websocket") is replacing
+        assert engine.media_closed == []
+        assert engine.stt_closed == []  # the new socket's STT stays open
+
     def test_setup_attaches_websocket_to_existing_state(self):
         engine = FakeEngine()
         state = CallState(call_sid="CA_known", direction=CallDirection.INBOUND, caller_number="+1")
@@ -269,6 +329,33 @@ class TestRelaySetupHardening:
         assert engine.states == {}
         assert engine.speech_inputs == []
 
+    def test_reconnect_after_lost_transfer_state_is_accepted(self, monkeypatch):
+        """State lost while the target rang: the signed transfer-result callback
+        re-registers the call, so the reconnected relay `setup` is not refused
+        as an unknown SID and the caller can leave a message. Only the HTTP
+        signature is stubbed; the WS token check runs for real."""
+
+        async def _verified(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(twiml_server, "verify_http_request", _verified)
+        monkeypatch.setattr("pincer.voice.receptionist.profile.receptionist_active", lambda _s: False)
+        monkeypatch.setattr("pincer.voice.language.resolve_call_language", lambda *_a, **_k: "en")
+        monkeypatch.setattr(twiml_server, "_transfer_session_lookup", lambda _sid: None)
+        engine = FakeEngine()
+        client = _app_with_engine(engine)
+        result = client.post(
+            "/api/apps/twilio/transfer-result",
+            data={"CallSid": "CA_lost", "From": "+15550001111", "DialCallStatus": "busy", "CallStatus": "in-progress"},
+        )
+        assert "ConversationRelay" in result.text
+        assert engine.started == [("CA_lost", "+15550001111", CallDirection.INBOUND)]
+        with client.websocket_connect(_signed("/api/apps/twilio/relay")) as ws:
+            ws.send_text(json.dumps({"type": "setup", "callSid": "CA_lost", "from": "+15550001111"}))
+            ws.send_text(json.dumps({"type": "prompt", "voicePrompt": "Please call me back", "last": True}))
+        assert engine.answered == ["CA_lost"]
+        assert ("CA_lost", "Please call me back") in engine.speech_inputs
+
     def test_stream_with_unknown_sid_is_refused(self):
         engine = FakeEngine()
         client = _app_with_engine(engine)
@@ -359,6 +446,7 @@ class TestRelayWebSocketAuth:
         with client.websocket_connect(_signed("/api/apps/twilio/stream/CA_sig", WS_STREAM_PATH)) as ws:
             ws.send_text(json.dumps({"event": "connected"}))
             ws.send_text(json.dumps({"event": "stop"}))
+        assert engine.stt_closed == ["CA_sig"]  # its own close does close the STT
 
     def test_start_media_format_is_known_before_stt_setup(self):
         """setup_media_stream_stt checks Twilio's declared format; it has to

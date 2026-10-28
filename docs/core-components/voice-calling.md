@@ -847,6 +847,7 @@ The `phone_contacts` bundled skill provides tools for managing a contact directo
 | `PINCER_VOICE_MAX_CALL_DURATION` | No | `600` | Max call seconds |
 | `PINCER_VOICE_HANGUP_GRACE_S` | No | `2.0` | Seconds between the agent's farewell finishing and the hangup (the "both said bye" window) |
 | `PINCER_VOICE_MAX_HOLD_TIME` | No | `300` | Max IVR hold seconds |
+| `PINCER_VOICE_TRANSFER_MAX_DURATION_S` | No | `3600` | Ceiling for a call transferred to a human (`<Dial timeLimit>`, 60–14400); also the stuck-call allowance for transferred calls |
 | `PINCER_VOICE_RECORDING_ENABLED` | No | `false` | Enable recording |
 | `PINCER_VOICE_CONSENT_MODE` | No | `one_party` | Consent mode |
 | `PINCER_VOICE_OUTBOUND_ENABLED` | No | `false` | Enable outbound calls |
@@ -925,6 +926,21 @@ The tool executed but returned an error. Check logs for the exact cause:
    Should return `OK` (200). ngrok free tier may show a browser interstitial on the very first request — use a static domain to avoid it. See [Local Tunnel (ngrok)](../getting-started/local-tunnel.md). Note the ConversationRelay endpoint itself is a WebSocket (`wss://<host>/api/apps/twilio/relay`) — an `https://` URL in the `<ConversationRelay url>` attribute fails at `<Connect>` time with Twilio error 64101 ("application error" right after the greeting).
 
 4. **Twilio Debugger** — Check Twilio Console > Monitor > Logs for call attempts and any webhook or API errors.
+
+### Transfer to a human fails at once with "connection override"
+
+`PINCER_VOICE_WEBHOOK_BASE_URL` must not carry a `#` fragment, so no Twilio
+[connection overrides](https://www.twilio.com/docs/usage/webhooks/webhooks-connection-overrides)
+(`#rc=…`, `#rt=…`, `#rp=…`). The receptionist's `<Dial>` result URL is built
+from it, and the transfer is refused (the caller is offered message-taking
+instead) when that URL has a fragment: the dial token Pincer appends would sit
+inside the fragment, which Twilio never sends, and read-timeout retries would
+break how `/api/apps/twilio/transfer-result` answers repeated deliveries of a
+dial result. Twilio's defaults (retry once, only when the connection itself
+failed) are what that endpoint is built for.
+
+Calls whose ConversationRelay events arrive over the deprecated HTTP
+`/relay-webhook` never get a human transfer; the receptionist takes a message instead.
 
 ---
 

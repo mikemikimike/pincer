@@ -133,12 +133,47 @@ class VoiceChannel(BaseChannel):
         engine.set_on_call_end(self._handle_call_end)
         if hasattr(engine, "set_on_call_start"):
             engine.set_on_call_start(self._handle_call_start)
+        if hasattr(engine, "set_on_transfer_end"):
+            engine.set_on_transfer_end(self._handle_transfer_end)
+        if hasattr(engine, "set_on_transfer_settled"):
+            engine.set_on_transfer_settled(self._handle_transfer_settled)
         engine.metrics_registry = self.metrics
 
     def set_tool_registry(self, tools: Any) -> None:
         """Sprint 12: the receptionist reads free/busy and writes bookings
         through the registry (via the Sprint 11 gate)."""
         self._tools = tools
+
+    async def _handle_transfer_end(self, call_sid: str) -> None:
+        """The <Dial> is over and the call is ours again. The receptionist
+        session normally moved the phase already; without one (e.g. no session
+        resolver) the call would stay in the untimed TRANSFERRING phase."""
+        sm = self._state_machines.get(call_sid)
+        if sm is not None and sm.phase == CallPhase.TRANSFERRING:
+            sm.transition(CallPhase.TAKE_MESSAGE, "transfer_ended")
+
+    async def _handle_transfer_settled(self, call_sid: str, outcome: str) -> None:
+        """A timed-out transfer redirect was settled outside any turn (see
+        VoiceEngine._settle_unconfirmed_redirect). ``not_applied``: the caller
+        is still in the relay, waiting in silence, so the receptionist apologizes
+        and takes a message; it speaks through its gate, which logs the line in
+        the transcript like any other agent line. ``hung_up``: the caller left
+        before any <Dial>; record that before the engine finalizes the call.
+        ``applied_late``: a redirect given up as not applied went live after all."""
+        if outcome == "applied_late":
+            # The redirect went live after all: back to the untimed phase, or
+            # the message-taking timeout would hang up a bridged call.
+            sm = self._state_machines.get(call_sid)
+            if sm is not None and sm.phase == CallPhase.TAKE_MESSAGE:
+                sm.transition(CallPhase.TRANSFERRING, "transfer_applied_late")
+            return
+        session = self._reception_sessions.get(call_sid)
+        if session is None:
+            return
+        if outcome == "not_applied":
+            await session.speak(await session.on_transfer_failed())
+        elif outcome == "hung_up":
+            session.on_transfer_abandoned()
 
     async def _handle_call_start(self, call_sid: str, state: CallState) -> None:
         """Engine registered a call: start tracking now (silence rule, receptionist greeting)."""
@@ -461,15 +496,7 @@ class VoiceChannel(BaseChannel):
                 for session in list(self._reception_sessions.values()):
                     with contextlib.suppress(Exception):
                         await session.check_silence()
-                # Per-call guard: one bad call must not stop timeout
-                # enforcement for every other concurrently active call.
-                for call_sid, sm in list(self._state_machines.items()):
-                    if sm.is_terminal or not sm.check_timeout():
-                        continue
-                    try:
-                        await self._handle_phase_timeout(call_sid, sm)
-                    except Exception:
-                        logger.exception("Phase timeout handling failed [%s]", call_sid)
+                await self._enforce_phase_timeouts()
                 try:
                     await self._reap_stuck_calls()
                 except Exception:
@@ -478,6 +505,24 @@ class VoiceChannel(BaseChannel):
             pass
         except Exception:
             logger.exception("Voice watchdog error")
+
+    async def _enforce_phase_timeouts(self) -> None:
+        """One watchdog pass over the phase timeouts. A call the engine marks
+        transferring is bridged to a human (or may be: a late-applied redirect),
+        whatever phase the session got to, so it is not ours to time: the same
+        source of truth the stuck-call reaper uses."""
+        # Per-call guard: one bad call must not stop timeout
+        # enforcement for every other concurrently active call.
+        for call_sid, sm in list(self._state_machines.items()):
+            if sm.is_terminal or not sm.check_timeout():
+                continue
+            state = self._engine.get_call_state(call_sid) if self._engine else None
+            if state is not None and state.metadata.get("transferring"):
+                continue
+            try:
+                await self._handle_phase_timeout(call_sid, sm)
+            except Exception:
+                logger.exception("Phase timeout handling failed [%s]", call_sid)
 
     async def _reap_stuck_calls(self) -> None:
         """Force-end and page on calls past max_duration + grace (T9.2)."""
@@ -496,10 +541,11 @@ class VoiceChannel(BaseChannel):
         for entry in signal.detail.get("stuck", []):
             call_sid = str(entry.get("call_sid", ""))
             logger.error(
-                "Stuck call detected [%s]: %ds (%ds over the limit) — force-ending",
+                "Stuck call detected [%s]: %ss > %ss limit%s — force-ending",
                 call_sid,
-                entry.get("duration_seconds"),
-                entry.get("over_by_seconds"),
+                entry.get("elapsed_seconds"),
+                entry.get("limit_seconds"),
+                " (transfer)" if entry.get("transferring") else "",
             )
             # Recorded on the call itself: a stuck call that was never answered
             # has no state machine whose reason would say so.
@@ -525,9 +571,11 @@ class VoiceChannel(BaseChannel):
                         rule="stuck_calls",
                         severity=Severity.PAGE,
                         title=f"{int(signal.value)} stuck call(s) force-ended",
-                        detail=(
-                            f"Exceeded {signal.detail.get('threshold_seconds')}s: "
-                            + ", ".join(str(c.get("call_sid")) for c in signal.detail.get("stuck", []))
+                        # per call: a transferred call has a different limit
+                        detail=", ".join(
+                            f"{c.get('call_sid')}: {c.get('elapsed_seconds')}s > {c.get('limit_seconds')}s limit"
+                            + (" (transfer)" if c.get("transferring") else "")
+                            for c in signal.detail.get("stuck", [])
                         ),
                         value=signal.value,
                         threshold=0.0,
@@ -1703,7 +1751,7 @@ class VoiceChannel(BaseChannel):
         self._close_turn_trace(call_sid)
 
         # A code, not display text: the column is read by machines.
-        reason = str(state.metadata.get(END_CODE_KEY) or "")
+        reason = str(state.metadata.get(END_CODE_KEY) or state.metadata.get("remote_end_reason") or "")
         if not reason and sm is not None and sm.state.transitions:
             reason = str(sm.state.transitions[-1].reason or "")
         with contextlib.suppress(Exception):

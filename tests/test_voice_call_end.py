@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 from voice_harness.fake_engine import FakeVoiceEngine
 from voice_harness.settings import apply_in_call_tool_defaults, apply_test_paths
+from voice_harness.strict_async import FAIL_ON_UNAWAITED_COROUTINE
 
 from pincer.channels.phone_calls import VoiceChannel
 from pincer.core.agent import StreamEventType
@@ -16,6 +17,7 @@ from pincer.voice import call_end, status_notify
 from pincer.voice.engine import CallDirection
 from pincer.voice.state_machine import CallPhase
 
+pytestmark = FAIL_ON_UNAWAITED_COROUTINE
 CALL = "CA_end"
 _REAL_ESTIMATE = call_end.estimate_speech_seconds  # the autouse fixture below zeroes the module attribute
 
@@ -209,3 +211,45 @@ async def test_regular_turns_never_schedule_hangup():
     await _say(engine, "Thursday please")
     assert CALL not in engine.ended and not channel._hangup_pending(CALL)
     await channel.stop()
+
+
+# ── /status completed: Twilio already ended the call ─────────
+
+
+async def test_status_completed_does_not_rest_hangup():
+    """A REST hangup on a call Twilio already ended can only fail (and used to
+    log "Failed to end call" on every normal end). Finalize locally instead."""
+    from unittest.mock import AsyncMock, patch
+
+    import httpx
+    from fastapi import FastAPI
+
+    from pincer.voice import twiml_server
+    from pincer.voice.engine import ConversationRelayEngine
+
+    settings = _settings()
+    settings.voice_webhook_validate = False
+    settings.twilio_auth_token = MagicMock()
+    settings.twilio_auth_token.get_secret_value.return_value = ""
+    engine = ConversationRelayEngine(settings)
+    on_end = AsyncMock()
+    engine.set_on_call_end(on_end)
+    await engine.on_call_start(CALL, "+4917", CallDirection.INBOUND)
+
+    saved = twiml_server._engine, twiml_server._settings
+    twiml_server.init_voice_routes(engine, settings)
+    app = FastAPI()
+    app.include_router(twiml_server.twilio_router)
+    try:
+        with patch("twilio.rest.Client") as client_cls:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                for _ in range(2):  # a retried callback is a no-op
+                    response = await client.post(
+                        "/api/apps/twilio/status", data={"CallSid": CALL, "CallStatus": "completed"}
+                    )
+                    assert response.status_code == 200
+        client_cls.assert_not_called()
+        on_end.assert_awaited_once()
+        assert engine.get_call_state(CALL) is None
+    finally:
+        twiml_server._engine, twiml_server._settings = saved

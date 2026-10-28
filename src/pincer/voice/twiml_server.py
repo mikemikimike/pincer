@@ -18,6 +18,7 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response
 from starlette.websockets import WebSocketState
 
+from pincer.voice.call_locks import one_call_update_at_a_time
 from pincer.voice.twiml_builder import CALL_SID_PLACEHOLDER
 from pincer.voice.webhook_auth import (
     WS_MONITOR_PATH,
@@ -223,6 +224,8 @@ def _active_inbound_count() -> int:
         return 0
     from pincer.voice.engine import CallDirection
 
+    # A call bridged to a human still counts: a failed transfer reconnects it
+    # to the relay, and its slot must still be free when it does.
     return sum(1 for st in _engine.get_active_calls().values() if st.direction == CallDirection.INBOUND)
 
 
@@ -293,29 +296,383 @@ async def _record_declined_call(
 async def voice_transfer_result(request: Request) -> Response:
     """Sprint 12 §8.4: <Dial action> callback after a receptionist transfer.
 
-    completed → nothing to do (Twilio hangs up after the bridged leg). Anything
-    else (busy / no-answer / failed / canceled) → apology + message-taking:
-    the call is reconnected to the relay with the apology as its greeting and
-    the session already in TAKE_MESSAGE (name question asked)."""
+    completed / answered / DialBridged=true → the caller talked to the human:
+    record it and finalize the call (Twilio has ended it; no REST hangup).
+    busy / no-answer / failed / canceled → apology + message-taking: the call
+    is reconnected to the relay with the apology as its greeting and the
+    session already in TAKE_MESSAGE (name question asked) — unless the caller
+    already hung up while the target was ringing, in which case there is
+    nothing to reconnect. Any other status (empty, unknown) counts as failed
+    while the caller is on the line; once the call is completed it is not
+    guessed at: the call is finalized and the report says the transfer started.
+    No state with the caller still on the line (process restarted while the
+    target rang) → re-register the call, resume its new receptionist session in
+    TAKE_MESSAGE, and reconnect with the apology. If Twilio cannot be asked
+    whether the caller is still there, the callback's own CallStatus decides.
+    Idempotent, one delivery per call at a time: a callback for a finalized
+    call, or one Twilio says is no longer in progress, only hangs up; a copy of
+    a result already processed counts nothing, leaves the session alone, and
+    is answered from its dial's record (one per dial in ``DIALS_KEY``, keyed by
+    the ``dial`` token `transfer_call` puts in the action URL, else by
+    ``DialCallSid``; see `dial_key`): the recorded reconnect TwiML until the
+    reconnected relay connects, an empty ``<Response/>`` after that or for an
+    earlier dial (`_answer_copy`). The current dial's result is handled even when the
+    call is not marked transferring: the redirect can raise after Twilio
+    applied it, and then Twilio is waiting on this answer.
+
+    Why an empty answer is safe there: Twilio executes at most one action
+    response per <Dial>. The empty answer is given only when this dial's
+    reconnected relay has connected (proof that Twilio executed our answer for
+    it) or a later dial exists (which needed that answer executed first), so
+    Twilio will not execute it. No other TwiML would be safer: if executed, any
+    of it would replace the live relay. A retry that Twilio does execute comes
+    before any relay connected, and the per-call lock puts it behind the first
+    delivery, so it gets the recorded reconnect. That holds under Twilio's
+    default connection overrides (ct=5000ms, rt=15000ms, tt=15000ms, rc=1,
+    rp=ct: a retry only after a failed TCP connect or TLS handshake; see
+    https://www.twilio.com/docs/usage/webhooks/webhooks-connection-overrides)
+    and under read-timeout retries or a proxy that re-sends the POST alike.
+    `transfer_call` still refuses an action URL with overrides (``#…``)."""
     if await _authenticate(request) is None:
         return _forbidden()
     form = await request.form()
+    # One delivery of a call's dial result at a time: a copy arriving while the
+    # first is still awaiting (Twilio's status, the call's registration, the
+    # session) waits, then finds that work done and replays its answer.
+    async with one_call_update_at_a_time(str(form.get("CallSid", ""))):
+        return await _handle_transfer_result(form, str(request.query_params.get("dial", "")))
+
+
+async def _handle_transfer_result(form: Any, dial_id: str) -> Response:
+    from pincer.voice.engine import DIAL_ID_KEY, dial_key
+
     call_sid = str(form.get("CallSid", ""))
     dial_status = str(form.get("DialCallStatus", "")).lower()
-    logger.info("Transfer result [%s]: %s", call_sid, dial_status or "-")
-    if dial_status == "completed" or not _engine or not _settings:
-        return _twiml_response("<Response><Hangup/></Response>")
+    call_status = str(form.get("CallStatus", "")).lower()
+    dial_call_sid = str(form.get("DialCallSid", ""))
+    dial_duration = _int_or_none(form.get("DialCallDuration"))
+    dial_bridged = str(form.get("DialBridged", "")).lower() == "true"
+    bridged = dial_status in ("completed", "answered") or dial_bridged
+    # The dial's result as its record keeps it (`_record_dial_result`).
+    result: dict[str, Any] = {
+        "dial_id": dial_id,
+        "dial_status": dial_status,
+        "dial_call_sid": dial_call_sid,
+        "dial_duration_s": dial_duration,
+        "dial_bridged": dial_bridged,
+    }
+    logger.info("Transfer result [%s]: %s (call %s)", call_sid, dial_status or "-", call_status or "-")
+    hangup = _twiml_response("<Response><Hangup/></Response>")
+    no_op = _twiml_response("<Response/>")
+    if not _engine or not _settings:
+        return hangup
+    state = _engine.get_call_state(call_sid)
+    if state is None:
+        if bridged or call_status == "completed":
+            logger.info("Transfer result [%s] for a call already finalized — nothing to do", call_sid)
+            return hangup
+        if _already_torn_down(call_sid):
+            # A late/replayed callback for a call we ended: re-registering it
+            # would create a phantom call that never gets media and holds a
+            # capacity slot until the stuck-call reaper pages.
+            logger.info("Transfer result [%s] for a call already torn down — nothing to do", call_sid)
+            return hangup
+        # The in-memory record above is gone after a restart, after
+        # _ENDED_CALL_TTL_S, or after _MAX_ENDED_CALLS other calls: Twilio is
+        # the authority on whether the caller is still on the line.
+        try:
+            twilio_status = await _engine.fetch_call_status(call_sid)
+        except Exception:
+            # Twilio cannot be asked: go by the callback itself, which says the
+            # caller is on the line. Hanging up would drop a live caller with no
+            # trace or report; a phantom call (a replay during a Twilio outage)
+            # is the lesser risk, and the stuck-call reaper bounds it.
+            logger.exception("Transfer result [%s]: Twilio status check failed — trusting the callback", call_sid)
+            twilio_status = "in-progress"
+        if twilio_status != "in-progress":
+            logger.info("Transfer result [%s] for a call Twilio reports %r — nothing to do", call_sid, twilio_status)
+            return hangup
+        # Call state lost (restart/redeploy while the target rang), but the
+        # caller is still on the line: fall back to message-taking.
+        logger.warning("Transfer result [%s] with no call state — reconnecting the caller", call_sid)
+        from pincer.voice.engine import CallDirection
+        from pincer.voice.language import resolve_call_language
+        from pincer.voice.receptionist.profile import get_profile, receptionist_active
+        from pincer.voice.telemetry import hooks as telemetry
 
+        profile = get_profile() if receptionist_active(_settings) else None
+        language = resolve_call_language(_settings, profile.default_language if profile else "")
+        caller = str(form.get("From", ""))
+        # Register the call here (this request is signature-verified, like
+        # /webhook): the relay `setup` for an unknown SID is refused, so without
+        # this the caller would hear the apology and then be dropped.
+        telemetry.inbound_webhook(
+            call_sid,
+            from_number=caller,
+            to_number=str(form.get("To", "")),
+            engine=str(getattr(_settings, "voice_engine", "") or ""),
+            language=language,
+        )
+        try:
+            # No capacity, allowlist or blocklist check, on purpose: this caller
+            # was already admitted by /webhook before the transfer started.
+            recovered = await _engine.on_call_start(call_sid, caller, CallDirection.INBOUND, language=language)
+            # Record the dial result on the recovered state before the next
+            # await, so a retry of this callback replays the reconnect instead
+            # of taking the main path. (The per-call lock already keeps a
+            # concurrent copy out until this request is done.)
+            from pincer.voice.receptionist.session import TRANSFER_DIAL_TIMEOUT_S
+
+            # The lost dial was the receptionist's: its target and dial timeout
+            # are the profile's and the session's, so its start can name them.
+            result = {
+                **result,
+                "target": str(profile.transfer.target if profile is not None else ""),
+                "dial_timeout_s": TRANSFER_DIAL_TIMEOUT_S,
+                "recovered": True,
+            }
+            record: dict[str, Any] = dict(result)
+            if isinstance(getattr(recovered, "metadata", None), dict):
+                record = _record_dial_result(recovered, dial_key(dial_id, dial_call_sid), result)
+                if dial_id:
+                    recovered.metadata[DIAL_ID_KEY] = dial_id
+            # Once, on the trace just opened: a retry replays the reconnect below
+            # the state check and records nothing.
+            telemetry.transfer_result(call_sid, dial_status, dial_duration_s=dial_duration)
+            # The channel started a fresh receptionist session (RECEPTION_INTENT);
+            # resume it in TAKE_MESSAGE, as a failed transfer does, so the first
+            # turn asks for the name instead of greeting the caller again.
+            session = _transfer_session_lookup(call_sid)
+            greeting, response = await _resume_failed_transfer(call_sid, session, dial_status, language)
+            _record_reconnect(record, greeting, language)
+            return response
+        except Exception:
+            # Twilio drops the caller if we answer 500, and a registered call
+            # that never gets media holds a capacity slot until the stuck-call
+            # reaper pages: hang up and finalize whatever got registered.
+            logger.exception("Transfer result [%s]: recovery failed — finalizing the recovered call", call_sid)
+            await _finalize_failed_recovery(call_sid)
+            return hangup
+
+    from pincer.voice.telemetry import hooks as telemetry
+
+    language = str(getattr(state, "language", "") or "en")
+    key, record = _dial_record_for(state, dial_id, dial_call_sid)
+    if record is not None and "dial_status" in record:
+        # A copy of a result we already processed: count nothing twice, leave
+        # the session alone, and answer from the dial's record.
+        is_current = record is state.metadata.get("transfer")
+        return _answer_copy(call_sid, key, record, is_current=is_current, language=language)
+    transferring = bool(state.metadata.get("transferring"))
+    if dial_id and dial_id != state.metadata.get(DIAL_ID_KEY):
+        # A later dial replaced this one, which needs the call back from this
+        # dial first: Twilio is not waiting on this answer.
+        logger.info("Transfer result [%s] for an earlier dial %s — ignored", call_sid, key)
+        return no_op
+    if not transferring:
+        if not dial_id:
+            # No dial token (an action URL from before tokens): this may be a
+            # stray copy, or the result Twilio is waiting on after a redirect
+            # that raised although Twilio applied it. Answer so that both are
+            # safe: Twilio executes the answer only in the second case, where
+            # the caller needs it. Count nothing and leave the session alone.
+            logger.warning("Transfer result [%s] without a dial token for a call not being transferred", call_sid)
+            if bridged:
+                return hangup
+            return _reconnect_after_transfer(call_sid, language, _transfer_failed_line(language))
+        # The current dial's own result, yet the call is not marked
+        # transferring: transfer_call's redirect raised although Twilio
+        # applied it. Twilio is waiting on this answer: handle it as the
+        # dial's result. An empty answer would end the call.
+        logger.warning("Transfer result [%s] for dial %s whose redirect reported failure — handling it", call_sid, key)
+    record = _record_dial_result(state, key, result)
+    telemetry.transfer_result(call_sid, dial_status, dial_duration_s=dial_duration)
+    session = _transfer_session_lookup(call_sid)
+
+    if bridged:
+        if session is not None:
+            session.on_transfer_completed(dial_duration)
+        await _engine.finish_remote_ended(call_sid, reason="transferred")
+        return hangup
+
+    unknown_result = dial_status not in _TRANSFER_RESULTS
+    if call_status == "completed":
+        if unknown_result:
+            # The call is over and the dial result is unknown: don't guess.
+            logger.warning("Transfer result [%s]: unknown DialCallStatus %r — finalizing", call_sid, dial_status)
+            await _engine.finish_remote_ended(call_sid, reason="transfer_result_unknown")
+            return hangup
+        # The caller hung up while the target was ringing.
+        if session is not None:
+            session.on_transfer_abandoned()
+        await _engine.finish_remote_ended(call_sid, reason="caller_hangup_during_transfer")
+        return hangup
+
+    if unknown_result:
+        # Not bridged and the caller is still on the line: whatever the status
+        # means, nobody took the call, so it is a failed transfer.
+        logger.warning("Transfer result [%s]: unknown DialCallStatus %r — treating as failed", call_sid, dial_status)
+    greeting, response = await _resume_failed_transfer(call_sid, session, dial_status, language)
+    _record_reconnect(record, greeting, language)
+    return response
+
+
+def _dial_record_for(state: Any, dial_id: str, dial_call_sid: str) -> tuple[str, dict[str, Any] | None]:
+    """The key and the record (if any) a dial result belongs to.
+
+    With a dial token, the token's record. Without one (an action URL from
+    before tokens): a recorded result with the same DialCallSid, else, while a
+    <Dial> is in flight, the current dial's record."""
+    from pincer.voice.engine import DIAL_ID_KEY, DIALS_KEY, dial_key
+
+    dials: dict[str, dict[str, Any]] = state.metadata.setdefault(DIALS_KEY, {})
+    if dial_id:
+        key = dial_key(dial_id, "")
+        return key, dials.get(key)
+    current = state.metadata.get("transfer")
+    for key, record in dials.items():
+        # an empty DialCallSid only matches the current dial's result
+        recorded = "dial_status" in record and record.get("dial_call_sid") == dial_call_sid
+        if recorded and (dial_call_sid or record is current):
+            return key, record
+    current_id = str(state.metadata.get(DIAL_ID_KEY, "") or "")
+    if state.metadata.get("transferring") and current_id and isinstance(current, dict):
+        return dial_key(current_id, ""), current
+    return dial_call_sid, None
+
+
+def _record_dial_result(state: Any, key: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Write a dial's result into its record (creating one for a dial we have
+    none for: lost state, or no dial token) and make it the current dial's
+    `transfer` view. The one place both the lost-state branch and the main path
+    record a result, so the replay rules read the same fields from either.
+
+    A result is proof its <Dial> ran, so the dial's start is recorded here when
+    nothing confirmed it before (a slow or failed redirect answer, lost state);
+    `note_transfer_started` records it once per dial."""
+    from pincer.voice.engine import DIALS_KEY, note_transfer_started
+
+    record: dict[str, Any] = state.metadata.setdefault(DIALS_KEY, {}).setdefault(key, {})
+    record.update(result)
+    state.metadata["transfer"] = record
+    note_transfer_started(str(state.call_sid), record)
+    return record
+
+
+def _record_reconnect(record: dict[str, Any], greeting: str, language: str) -> None:
+    """What a copy of this result is answered with: the reconnect is rebuilt
+    from these, not stored as TwiML, because its relay URL carries a signed
+    token that expires (`voice_signature_max_age_s`)."""
+    record["reconnect_greeting"] = greeting
+    record["reconnect_language"] = language
+
+
+def _answer_copy(call_sid: str, key: str, record: dict[str, Any], *, is_current: bool, language: str) -> Response:
+    """The answer to a copy of a dial result we already processed.
+
+    The recorded reconnect, rendered again (a fresh signed relay URL: the first
+    answer's token may be stale by now), while it is the current dial's and no
+    relay has connected for it: Twilio may be executing this copy. An empty
+    ``<Response/>`` once the relay connected, or for an earlier dial: Twilio
+    has already executed an answer for that <Dial> and executes at most one
+    per <Dial>. No TwiML would be harmless here if it were executed: any of it
+    replaces the live relay."""
+    if is_current and not record.get("reconnected"):
+        logger.info("Transfer result [%s] already handled (dial %s) — replaying reconnect", call_sid, key)
+        if "reconnect_greeting" in record:
+            language = str(record.get("reconnect_language", "") or language)
+            return _reconnect_after_transfer(call_sid, language, str(record["reconnect_greeting"]))
+        # the first delivery raised before its answer was recorded
+        return _reconnect_after_transfer(call_sid, language, _transfer_failed_line(language))
+    logger.info("Transfer result [%s] for dial %s already acted on — ignored", call_sid, key)
+    return _twiml_response("<Response/>")
+
+
+async def _resume_failed_transfer(call_sid: str, session: Any, dial_status: str, language: str) -> tuple[str, Response]:
+    """Nobody took the call and the caller is still on the line: resume the
+    receptionist session in TAKE_MESSAGE (apology + name question), take the
+    call out of TRANSFERRING, and build the reconnect TwiML. Returns the
+    greeting too, so the caller can record it for a retried callback to replay."""
+    try:
+        if session is not None:
+            session.transfer_attempted = True  # the report says the transfer did not connect
+            greeting = await session.on_transfer_failed(_TRANSFER_RESULTS.get(dial_status, "failed"))
+        else:
+            greeting = _transfer_failed_line(language)
+    finally:
+        # The dial is over: the call is ours again now, not when (or if) the
+        # reconnected relay/stream connects. This also takes the phase out of
+        # TRANSFERRING when there was no session to do it (no-op for a call
+        # recovered from lost state, which was never marked transferring).
+        # In `finally` so a failing session step cannot leave the call marked
+        # transferring: on_media_closed would then ignore the closing socket
+        # and the reaper would apply the long transfer allowance.
+        await _engine.end_transfer(call_sid)
+    return greeting, _reconnect_after_transfer(call_sid, language, greeting)
+
+
+def _mark_relay_webhook(call_sid: str) -> None:
+    """The call's events come over the deprecated HTTP relay: see RELAY_WEBHOOK_KEY."""
+    from pincer.voice.engine import RELAY_WEBHOOK_KEY
+
+    state = _engine.get_call_state(call_sid) if _engine and call_sid else None
+    metadata = getattr(state, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata[RELAY_WEBHOOK_KEY] = True
+
+
+def _note_reconnected(state: Any) -> None:
+    """Media connected for a call that has a transfer record: Twilio executed the
+    reconnect after a failed dial. The `transfer` view only exists from
+    `transfer_call` on, and moves to the next dial's own record, so this marks
+    the current dial's. A replay of that dial's result must no longer answer
+    with <Connect>."""
+    transfer = getattr(state, "metadata", {}).get("transfer") if state is not None else None
+    if isinstance(transfer, dict):
+        transfer["reconnected"] = True
+
+
+def _transfer_failed_line(language: str) -> str:
+    """The apology for a failed transfer, without a session to phrase it."""
+    from pincer.voice.prompts import get_prompt
+
+    lines = get_prompt("RECEPTIONIST_LINES", language) or {}
+    return str(lines.get("transfer_failed", ""))
+
+
+async def _finalize_failed_recovery(call_sid: str) -> None:
+    """A lost-state call whose recovery raised: finalize it as a failed call
+    with its own code (its session sits in a benign phase, so a plain finalize
+    would count the hang-up as a completed call). Never raises, so the handler
+    still answers with a hang-up. The trace opened by `inbound_webhook` is
+    closed here when the end-of-call path did not close it: nothing was
+    registered, or finalizing raised."""
+    from pincer.observability.failure_codes import FailureCode
+    from pincer.voice.engine import set_end_cause
+    from pincer.voice.telemetry import hooks as telemetry
+    from pincer.voice.telemetry.outcomes import STATUS_FAILED
+
+    assert _engine is not None
+    code = FailureCode.TRANSFER_RECOVERY_FAILED
+    state = _engine.get_call_state(call_sid)
+    if state is not None:
+        set_end_cause(state, code)
+        try:
+            await _engine.finish_remote_ended(call_sid, reason=str(code))
+            return
+        except Exception:
+            # The call may stay registered: the stuck-call reaper is the backstop.
+            logger.exception("Transfer result [%s]: finalizing the failed recovery failed", call_sid)
+    await telemetry.call_ended(call_sid, status=STATUS_FAILED, failure_code=str(code), termination_reason=str(code))
+
+
+def _reconnect_after_transfer(call_sid: str, language: str, greeting: str) -> Response:
+    """ConversationRelay TwiML for a caller back from a failed transfer, with
+    ``greeting`` (if any) replacing the welcome greeting."""
     from xml.sax.saxutils import escape
 
     from pincer.voice.twiml_builder import build_connect_twiml
 
-    state = _engine.get_call_state(call_sid)
-    session = _transfer_session_lookup(call_sid)
-    language = str(getattr(state, "language", "") or "en")
-    greeting = ""
-    if session is not None:
-        greeting = await session.on_transfer_failed()
     twiml = build_connect_twiml(_settings, call_sid=call_sid, direction="inbound", language=language)
     if greeting:
         # Replace the welcome greeting with the apology + first question
@@ -323,10 +680,22 @@ async def voice_transfer_result(request: Request) -> Response:
 
         escaped = escape(greeting, {'"': "&quot;"})
         if "welcomeGreeting=" in twiml:
-            twiml = _re.sub(r'welcomeGreeting="[^"]*"', f'welcomeGreeting="{escaped}"', twiml, count=1)
+            # A function, not a template: a `\` in the greeting stays text
+            twiml = _re.sub(r'welcomeGreeting="[^"]*"', lambda _m: f'welcomeGreeting="{escaped}"', twiml, count=1)
         else:
             twiml = twiml.replace("<ConversationRelay ", f'<ConversationRelay welcomeGreeting="{escaped}" ', 1)
     return _twiml_response(twiml)
+
+
+# DialCallStatus → the `result` label of pincer.voice.receptionist.transfers
+_TRANSFER_RESULTS = {"busy": "busy", "no-answer": "no_answer", "failed": "failed", "canceled": "failed"}
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 _transfer_session_resolver: Any = None
@@ -356,18 +725,27 @@ def _report_language(call_sid: str) -> str:
 
 
 def _already_torn_down(call_sid: str) -> bool:
-    """Whether `end_call` already ran for this call.
+    """Whether the engine tore this call down recently (`was_recently_ended`).
 
-    From that point the post-call pipeline — a background task — owns the final
-    user message, so a status webhook that finds no live state must not send
-    its own generic ending: that consumes the ENDED stage and the real report
-    is dropped.
+    Two callers rely on it:
 
-    `is True` on purpose: MagicMock engines in tests answer every attribute.
+    - The status and AMD webhooks: from teardown on, the post-call pipeline (a
+      background task) owns the final user message, so a webhook that finds no
+      live state must not send its own generic ending. That consumes the ENDED
+      stage and the real report is dropped.
+    - /transfer-result's lost-state branch: a replayed callback for a call we
+      ended must not re-register it as a phantom INBOUND call that never gets
+      media and holds a capacity slot until the stuck-call reaper pages.
+
+    The record is in memory only: it is lost on restart, forgotten after
+    `_ENDED_CALL_TTL_S` (900 s), and evicted after `_MAX_ENDED_CALLS` (500)
+    newer teardowns. A miss therefore does not mean the call is live; the
+    transfer branch asks Twilio (`fetch_call_status`) before recovering. Narrow
+    this for one caller and the other changes too.
     """
     if _engine is None:
         return False
-    return getattr(_engine, "was_recently_ended", lambda _sid: False)(call_sid) is True
+    return bool(getattr(_engine, "was_recently_ended", lambda _sid: False)(call_sid))
 
 
 async def _handle_amd_verdict(call_sid: str, answered_by: str, user_lang: str) -> bool:
@@ -496,54 +874,62 @@ async def voice_status(request: Request) -> PlainTextResponse:
     if await _handle_amd_verdict(call_sid, answered_by, user_lang):
         return PlainTextResponse("OK")
 
-    if status == "in-progress":
-        # Callee (a human) picked up
-        await notify_connected(call_sid)
+    # A terminal status waits for a /transfer-result in flight for the call: one
+    # recovering the call from lost state checks Twilio's status first, and a
+    # hang-up landing between that check and the registration must find the
+    # registered call and finalize it, not miss it and leave a phantom.
+    terminal = status in ("busy", "no-answer", "failed", "canceled", "completed")
+    async with one_call_update_at_a_time(call_sid) if terminal else contextlib.nullcontext():
+        if status == "in-progress":
+            # Callee (a human) picked up
+            await notify_connected(call_sid)
 
-    elif status in ("busy", "no-answer", "failed", "canceled"):
-        # Call never connected — the user still gets a final status (T1.3/T1.5)
-        from pincer.observability.failure_codes import NOT_CONNECTED_STATUS
-        from pincer.voice.engine import END_CODE_KEY, PROVIDER_STATUS_KEY, set_end_cause
-        from pincer.voice.outcome import not_connected_reason
+        elif status in ("busy", "no-answer", "failed", "canceled"):
+            # Call never connected — the user still gets a final status (T1.3/T1.5)
+            from pincer.observability.failure_codes import NOT_CONNECTED_STATUS
+            from pincer.voice.engine import END_CODE_KEY, PROVIDER_STATUS_KEY, set_end_cause
+            from pincer.voice.outcome import not_connected_reason
 
-        end_code = NOT_CONNECTED_STATUS[status]
-        # Appointment calls (Sprint 6): busy/no-answer/failed triggers the retry policy
-        if _settings is not None:
-            from pincer.voice.scheduling import handle_call_not_connected
+            end_code = NOT_CONNECTED_STATUS[status]
+            # Appointment calls (Sprint 6): busy/no-answer/failed triggers the retry policy
+            if _settings is not None:
+                from pincer.voice.scheduling import handle_call_not_connected
 
-            await handle_call_not_connected(call_sid, status, _settings)
-        nc_state = _engine.get_call_state(call_sid) if _engine else None
-        if _engine is not None and nc_state is not None:
-            # Conversation state exists (e.g. a late failure) -> the post-call
-            # pipeline sends the final report; pre-empting it here would
-            # consume the ENDED stage and drop that report. Only the code is
-            # stored; the report renders it in the report language.
-            if END_CODE_KEY not in nc_state.metadata:
-                # Only when this status is the cause: first writer wins.
-                nc_state.metadata[PROVIDER_STATUS_KEY] = status
-            set_end_cause(nc_state, end_code)
-            await _engine.end_call(call_sid)
-        elif _already_torn_down(call_sid):
-            logger.info("Status '%s' [%s] — call already torn down, pipeline owns the report", status, call_sid)
-        else:
-            # The call never had state, so no pipeline will run
-            await notify_ended(call_sid, not_connected_reason(end_code, user_lang, status))
+                await handle_call_not_connected(call_sid, status, _settings)
+            nc_state = _engine.get_call_state(call_sid) if _engine else None
+            if _engine is not None and nc_state is not None:
+                # Conversation state exists (e.g. a late failure) -> the post-call
+                # pipeline sends the final report; pre-empting it here would
+                # consume the ENDED stage and drop that report. Only the code is
+                # stored; the report renders it in the report language.
+                if END_CODE_KEY not in nc_state.metadata:
+                    # Only when this status is the cause: first writer wins.
+                    nc_state.metadata[PROVIDER_STATUS_KEY] = status
+                set_end_cause(nc_state, end_code)
+                await _engine.end_call(call_sid)
+            elif _already_torn_down(call_sid):
+                logger.info("Status '%s' [%s] — call already torn down, pipeline owns the report", status, call_sid)
+            else:
+                # The call never had state, so no pipeline will run
+                await notify_ended(call_sid, not_connected_reason(end_code, user_lang, status))
 
-    elif status == "completed" and _engine:
-        state = _engine.get_call_state(call_sid)
-        if state:
-            await _engine.end_call(call_sid)
-        elif _already_torn_down(call_sid):
-            # Race: end_call (AMD hangup, caller hangup, shutdown) popped the
-            # state and handed the final message to its post-call pipeline,
-            # which runs as a background task. Sending the generic ending here
-            # consumes the ENDED stage first, and the real report — the
-            # voicemail outcome, the summary — is then silently dropped.
-            logger.info("Status 'completed' [%s] — call already torn down, pipeline owns the report", call_sid)
-        else:
-            # Ended before any conversation state existed (e.g. hangup during AMD)
-            ended_texts = {"en": "call ended", "de": "Anruf beendet", "uk": "дзвінок завершено"}
-            await notify_ended(call_sid, ended_texts[user_lang])
+        elif status == "completed" and _engine:
+            state = _engine.get_call_state(call_sid)
+            if state:
+                # Twilio has already ended the call: finalize without a REST
+                # hangup, which could only fail.
+                await _engine.finish_remote_ended(call_sid, reason="provider_completed")
+            elif _already_torn_down(call_sid):
+                # Race: end_call (AMD hangup, caller hangup, shutdown) popped the
+                # state and handed the final message to its post-call pipeline,
+                # which runs as a background task. Sending the generic ending here
+                # consumes the ENDED stage first, and the real report — the
+                # voicemail outcome, the summary — is then silently dropped.
+                logger.info("Status 'completed' [%s] — call already torn down, pipeline owns the report", call_sid)
+            else:
+                # Ended before any conversation state existed (e.g. hangup during AMD)
+                ended_texts = {"en": "call ended", "de": "Anruf beendet", "uk": "дзвінок завершено"}
+                await notify_ended(call_sid, ended_texts[user_lang])
 
     return PlainTextResponse("OK")
 
@@ -621,10 +1007,9 @@ async def relay_ws(websocket: WebSocket) -> None:
                 call_sid = str(msg.get("callSid", ""))
                 caller = str(msg.get("from", ""))
                 logger.info("ConversationRelay connected: %s from %s", call_sid, caller)
+                # back from a <Dial> transfer: the call is ours again
+                await _engine.end_transfer(call_sid)
                 state = _engine.get_call_state(call_sid)
-                if state is not None:
-                    # back from a <Dial> transfer: the call is ours again
-                    state.metadata.pop("transferring", None)
                 if state is None:
                     state = await _resolve_setup_state(
                         call_sid,
@@ -659,6 +1044,7 @@ async def relay_ws(websocket: WebSocket) -> None:
                 from pincer.voice.telemetry import hooks as telemetry
 
                 telemetry.media_open(call_sid, engine="conversation_relay")
+                _note_reconnected(state)
                 # `setup` is Twilio's "the callee picked up". Every clock in
                 # the call starts from here — an outbound state exists from
                 # before the dial, so registration is NOT an answer.
@@ -896,6 +1282,7 @@ async def relay_webhook(request: Request) -> Response:
 
     call_sid = str(body.get("CallSid", body.get("callSid", "")))
     event_type = str(body.get("type", ""))
+    _mark_relay_webhook(call_sid)
 
     if event_type == "prompt":
         text = str(body.get("voicePrompt", ""))
@@ -916,6 +1303,8 @@ async def relay_webhook(request: Request) -> Response:
                 verified=_was_verified(request),
             )
         if call_sid:
+            _mark_relay_webhook(call_sid)  # registered just now
+            _note_reconnected(_engine.get_call_state(call_sid))
             await _engine.mark_call_answered(call_sid)
 
     elif event_type == "interrupt":
@@ -1002,6 +1391,9 @@ async def media_stream_ws(websocket: WebSocket, call_sid: str) -> None:
                     if hasattr(_engine, "setup_media_stream_stt"):
                         await _engine.setup_media_stream_stt(call_sid, stream_sid)
                 logger.info("Stream started: %s (stream=%s)", call_sid, stream_sid)
+                # back from a <Dial> transfer: the call is ours again
+                await _engine.end_transfer(call_sid)
+                _note_reconnected(state)
 
             elif event == "media":
                 payload = msg.get("media", {}).get("payload", "")
@@ -1025,9 +1417,13 @@ async def media_stream_ws(websocket: WebSocket, call_sid: str) -> None:
     except Exception:
         logger.exception("Media stream error: %s", call_sid)
     finally:
-        if _engine and hasattr(_engine, "close_media_stream"):
-            await _engine.close_media_stream(call_sid)
-        if state:
+        # Only this socket's own media: if a new socket took over the call,
+        # closing the call's STT, clearing its entry, or ending the call would
+        # cut off (or read as "media gone" for) the caller still streaming, as
+        # the relay handler already guards.
+        if state is not None and state.metadata.get("websocket") is websocket:
+            if _engine and hasattr(_engine, "close_media_stream"):
+                await _engine.close_media_stream(call_sid)
             state.metadata.pop("websocket", None)
             state.metadata.pop("stream_sid", None)
             telemetry.media_closed(call_sid, reason="media_socket_closed")

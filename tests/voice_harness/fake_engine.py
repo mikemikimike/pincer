@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
 from pincer.voice.engine import CallDirection, CallState, VoiceEngine
@@ -22,6 +23,19 @@ class FakeVoiceEngine(VoiceEngine):
         self.dtmf: dict[str, list[str]] = {}
         self.ended: list[str] = []
         self.transfers: dict[str, list[dict[str, Any]]] = {}  # Sprint 12: <Dial> redirects
+        # what Twilio reports for a call (fetch_call_status); an exception is raised
+        self.call_status: str | Exception = "in-progress"
+        self.status_fetches: list[str] = []
+        # the <Dial> redirect: transfer_raises=True is a definite Twilio error,
+        # an exception instance is raised as is; redirect_hook(call_sid) runs
+        # while the update is "in flight" (e.g. the caller hangs up)
+        self.transfer_raises: bool | BaseException = False
+        self.redirect_hook: Callable[[str], None] | None = None
+        # set: the update waits for it (Twilio slow to answer)
+        self.redirect_gate: asyncio.Event | None = None
+        # The <Dial> redirect obeys the hooks above; every other REST call goes
+        # to the engine's own TwilioRest (a test's fake, when it installs one).
+        self._rest = _HookedRedirect(self, self._rest)
         self.wait_for_turns = True
         #: When set, send_speech holds the agent "mid-sentence" until released;
         #: `speech_waiting` fires once something is held.
@@ -95,8 +109,17 @@ class FakeVoiceEngine(VoiceEngine):
                 "language": language,
             }
         )
-        if getattr(self, "transfer_raises", False):
-            raise RuntimeError("dial failed")
+        # the real bookkeeping (transferring flag, a fresh `transfer` record per
+        # dial, rollback on failure); only the Twilio redirect is faked
+        await super().transfer_call(
+            call_sid, target_number, timeout_s=timeout_s, action_url=action_url, announce=announce, language=language
+        )
+
+    async def fetch_call_status(self, call_sid: str) -> str:
+        self.status_fetches.append(call_sid)
+        if isinstance(self.call_status, Exception):
+            raise self.call_status
+        return self.call_status
 
     async def end_call(self, call_sid: str) -> None:
         if call_sid in self.ended:
@@ -111,3 +134,33 @@ class FakeVoiceEngine(VoiceEngine):
 
     async def close_media_stream(self, call_sid: str) -> None:
         pass
+
+
+class _HookedRedirect:
+    """The engine's TwilioRest with its call update (the <Dial> redirect; the
+    fake ends calls and sends DTMF itself) driven by the fake engine's
+    `transfer_raises` / `redirect_hook` / `redirect_gate`."""
+
+    def __init__(self, engine: FakeVoiceEngine, rest: Any) -> None:
+        object.__setattr__(self, "_engine", engine)
+        object.__setattr__(self, "_rest", rest)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._rest, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._rest, name, value)  # e.g. a test swapping in its Twilio client
+
+    async def update_call(self, call_sid: str, **_params: Any) -> None:
+        engine = self._engine
+        if engine.redirect_hook is not None:
+            engine.redirect_hook(call_sid)
+        if engine.redirect_gate is not None:
+            await engine.redirect_gate.wait()
+        if isinstance(engine.transfer_raises, BaseException):
+            raise engine.transfer_raises
+        if engine.transfer_raises:
+            from twilio.base.exceptions import TwilioRestException
+
+            # a definite Twilio error: the redirect was not applied
+            raise TwilioRestException(500, f"/Calls/{call_sid}", "dial failed")
