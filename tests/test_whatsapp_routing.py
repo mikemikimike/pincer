@@ -76,10 +76,12 @@ TOM_LID = "207855026221128"
 def _make_settings(
     whatsapp_self_chat_only: bool = True,
     whatsapp_group_trigger: str = "pincer",
+    whatsapp_group_trigger_on_mention: bool = False,
 ):
     settings = MagicMock()
     settings.whatsapp_self_chat_only = whatsapp_self_chat_only
     settings.whatsapp_group_trigger = whatsapp_group_trigger
+    settings.whatsapp_group_trigger_on_mention = whatsapp_group_trigger_on_mention
     settings.data_dir = "/tmp/test"
     settings.openai_api_key.get_secret_value.return_value = "test-key"
     return settings
@@ -494,12 +496,42 @@ class TestWhatsAppRouting:
     async def test_group_with_mention_responds(self, routing_channel):
         """Group message with owner JID in text (mention) → responds."""
         ch = routing_channel
+        ch._settings.whatsapp_group_trigger_on_mention = True
         event, _, _ = _make_message_event(
             from_me=False,
             chat_user="group123",
             sender_user=OTHER_PHONE,
             is_group=True,
             message_text=f"hey {OWNER_PHONE} what's up?",
+        )
+        await ch._on_message(MagicMock(), event)
+        ch._handler.assert_called_once()
+        ch._extract_message.assert_called_once()
+
+    async def test_group_mention_ignored_by_default(self, routing_channel):
+        """Mention without a trigger word, PINCER_WHATSAPP_GROUP_TRIGGER_ON_MENTION off → ignored."""
+        ch = routing_channel
+        event, _, _ = _make_message_event(
+            from_me=False,
+            chat_user="group123",
+            sender_user=OTHER_PHONE,
+            is_group=True,
+            mentioned_jid=f"{OWNER_PHONE}@s.whatsapp.net",
+            message_text=f"@{OWNER_PHONE} what's up?",
+        )
+        await ch._on_message(MagicMock(), event)
+        ch._handler.assert_not_called()
+        ch._extract_message.assert_not_called()
+
+    async def test_group_trigger_word_responds_by_default(self, routing_channel):
+        """Trigger word with PINCER_WHATSAPP_GROUP_TRIGGER_ON_MENTION off → responds."""
+        ch = routing_channel
+        event, _, _ = _make_message_event(
+            from_me=False,
+            chat_user="group123",
+            sender_user=OTHER_PHONE,
+            is_group=True,
+            message_text="pincer, what's up?",
         )
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_called_once()
@@ -527,7 +559,7 @@ class TestWhatsAppRouting:
             chat_user="group123",
             sender_user=OTHER_PHONE,
             is_group=True,
-            message_text=f"hey {OWNER_PHONE} what's up?",
+            message_text="pincer, what's up?",
         )
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_not_called()
@@ -573,7 +605,7 @@ class TestWhatsAppRouting:
             chat_user="group123",
             sender_user=OTHER_PHONE,
             is_group=True,
-            message_text=f"hey {OWNER_PHONE} what's up?",
+            message_text="pincer, what's up?",
         )
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_not_called()
@@ -592,7 +624,7 @@ class TestWhatsAppRouting:
             chat_user="group123",
             sender_user=OTHER_PHONE,
             is_group=True,
-            message_text=f"hey {OWNER_PHONE} what's up?",
+            message_text="pincer, what's up?",
         )
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_called_once()
@@ -621,7 +653,7 @@ class TestWhatsAppRouting:
             chat_user="group123",
             sender_user=OTHER_PHONE,
             is_group=True,
-            message_text=f"hey {OWNER_PHONE} what's up?",
+            message_text="pincer, what's up?",
         )
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_called_once()
@@ -651,7 +683,7 @@ class TestWhatsAppRouting:
             chat_user="group123",
             sender_user=OTHER_PHONE,
             is_group=True,
-            message_text=f"hey {OWNER_PHONE} what's up?",
+            message_text="pincer, what's up?",
         )
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_called_once()
@@ -665,6 +697,7 @@ class TestWhatsAppRouting:
         the owner's own WhatsApp number.
         """
         ch = routing_channel
+        ch._settings.whatsapp_group_trigger_on_mention = True
         event, _, _ = _make_message_event(
             from_me=True,
             chat_user="group123",
@@ -827,7 +860,7 @@ class TestLidPromotion:
             sender_alt_user=OTHER_PHONE,
             sender_alt_server="s.whatsapp.net",
             is_group=True,
-            message_text=f"hey {OWNER_PHONE} what's up?",
+            message_text="pincer, what's up?",
         )
 
         await ch._on_message(client, event)
@@ -953,7 +986,7 @@ class TestGroupReplyTarget:
     """A group is a reply target only while its message is being handled, so a
     later proactive send to the sender never lands in the group."""
 
-    def _group_event(self, text=f"hey {OWNER_PHONE} what's up?"):
+    def _group_event(self, text="pincer, what's up?"):
         event, _, _ = _make_message_event(
             from_me=False,
             chat_user="120363000000000000",
@@ -1005,7 +1038,7 @@ class TestGroupReplyTarget:
 
         ch._handler = AsyncMock(side_effect=handler)
         handling = asyncio.create_task(ch._on_message(ch._client, self._group_event()))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
 
         reminder = asyncio.create_task(ch._jid_for(TOM_LID))
         assert await reminder == f"{TOM_LID}@lid"
@@ -1029,7 +1062,7 @@ class TestGroupReplyTarget:
 
         ch._handler = AsyncMock(side_effect=handler)
         group = asyncio.create_task(ch._on_message(ch._client, self._group_event()))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
 
         await ch._on_message(ch._client, _lid_dm())
         assert dm_targets == [f"{TOM_LID}@lid"]
