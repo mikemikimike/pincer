@@ -379,6 +379,16 @@ mounting a directory. Install the new `remote-skills` extra
   wait in silence. The caller hears the failed-transfer apology and leaves a
   message instead; no transfer is recorded.
 
+### Security
+
+- **Dependencies bumped to clear 60 pip-audit advisories.** fastmcp 3.2.4 →
+  3.4.10 in every workspace MCP server (GHSA-7xgj-8392-5q4r; 3.4.10 fixes the
+  broken `fastmcp`/`fastmcp-slim` packaging split from 3.4.2), authlib 1.9.1,
+  brotli 1.2.1, certifi 2026.10.23, dnspython 2.9.0, filelock 4.2.4, fpdf2
+  2.8.9, msgpack 1.2.4, pillow 13.0.0 (with fastembed 0.9.1), setuptools
+  84.2.1, and the OpenTelemetry family (api/sdk/exporters 1.45.1,
+  instrumentation 0.66b1). anyio stays held at 4.13.0.
+
 ### Added
 
 #### Daemon mode: `pincer run -d`, `logs`, `status`, `stop`, `restart`
