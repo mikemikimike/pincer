@@ -145,6 +145,25 @@ async def test_closing_stream_releases_session_for_next_turn(
     assert not session_manager._turn_locks
 
 
+async def test_end_voice_session_can_run_inside_voice_turn(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry
+):
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
+    session_key = "voice:call"
+
+    async def stream(*args, **kwargs):
+        await agent.end_voice_session(session_key)
+        yield StreamChunk(StreamEventType.DONE, "finished")
+
+    with patch.object(agent, "_stream_voice_turn", side_effect=stream):
+        output = agent.stream_voice_turn("user", "voice", "finished", session_key=session_key)
+        chunk = await asyncio.wait_for(anext(output), timeout=1)
+        await output.aclose()
+
+    assert chunk.type == StreamEventType.DONE
+    assert not session_manager._turn_locks
+
+
 async def test_approval_wait_preserves_tool_results_before_next_turn(settings, mock_llm, session_manager, cost_tracker):
     entered = asyncio.Event()
     release = asyncio.Event()
