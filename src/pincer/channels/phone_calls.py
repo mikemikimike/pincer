@@ -1301,8 +1301,9 @@ class VoiceChannel(BaseChannel):
             gate.set_speaker(_gate_speak, lambda: spoken_any)
 
         agent_timings: dict[str, Any] = {}
+        stream = None
         try:
-            async for chunk in self._stream_agent.stream_voice_turn(
+            stream = self._stream_agent.stream_voice_turn(
                 user_id=canonical_id,
                 channel="voice",
                 text=text,
@@ -1310,7 +1311,8 @@ class VoiceChannel(BaseChannel):
                 channel_user_id=state.caller_number,
                 timings=agent_timings,
                 session_key=self._session_key(state),
-            ):
+            )
+            async for chunk in stream:
                 if chunk.type == StreamEventType.TEXT:
                     stamp("llm_first_token_ms")
                     if buffered_mode or suppress_rest:
@@ -1364,6 +1366,8 @@ class VoiceChannel(BaseChannel):
             self._log_turn_latency(call_sid, state, turn_no, t0, {**agent_timings, **stamps}, streamed=True, error=True)
             return
         finally:
+            if stream is not None:
+                await stream.aclose()
             if gate is not None:
                 gate.set_speaker(None)
 

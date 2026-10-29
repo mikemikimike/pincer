@@ -1,5 +1,6 @@
 """Tests for the ReAct agent loop."""
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -12,6 +13,7 @@ from pincer.core.agent import (
     _SESSION_CLEARED_TEXT,
     Agent,
     AgentResponse,
+    StreamChunk,
     StreamEventType,
     _is_tool_pair_error,
     _sanitize_tool_pairs,
@@ -35,6 +37,158 @@ _ANTHROPIC_UNPAIRED = (
 _ANTHROPIC_NO_TOOLS = (
     "Anthropic API error: 400 Requests which include `tool_use` or `tool_result` blocks must define tools."
 )
+
+
+async def test_turns_on_same_session_wait_and_other_sessions_continue(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry
+):
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = agent._handle_message
+
+    async def blocked(user_id, channel, text, *args):
+        if text == "first":
+            entered.set()
+            await release.wait()
+        return await original(user_id, channel, text, *args)
+
+    with patch.object(agent, "_handle_message", side_effect=blocked):
+        first = asyncio.create_task(agent.handle_message("user", "chat", "first", memory=False))
+        await entered.wait()
+        second = asyncio.create_task(agent.handle_message("user", "chat", "second", memory=False))
+        await asyncio.sleep(0)
+        assert not second.done()
+        await agent.handle_message("other", "chat", "other", memory=False)
+        release.set()
+        await asyncio.gather(first, second)
+
+    session = await session_manager.get_or_create("user", "chat")
+    assert [m.content for m in session.messages if m.role == MessageRole.USER] == ["first", "second"]
+    assert not session_manager._turn_locks
+
+
+async def test_cancelled_waiter_does_not_release_active_turn(session_manager):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold():
+        async with session_manager.turn("user", "chat"):
+            entered.set()
+            await release.wait()
+
+    first = asyncio.create_task(hold())
+    await entered.wait()
+    waiter = asyncio.create_task(hold())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert "chat:user" in session_manager._turn_locks
+    release.set()
+    await first
+    assert not session_manager._turn_locks
+
+
+async def test_explicit_session_key_serializes_across_channels(session_manager):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def first():
+        async with session_manager.turn("user-a", "channel-a", "shared"):
+            entered.set()
+            await release.wait()
+
+    async def second():
+        async with session_manager.turn("user-b", "channel-b", "shared"):
+            second_entered.set()
+
+    active = asyncio.create_task(first())
+    await entered.wait()
+    queued = asyncio.create_task(second())
+    await asyncio.sleep(0)
+    assert not second_entered.is_set()
+    release.set()
+    await asyncio.gather(active, queued)
+    assert second_entered.is_set()
+    assert not session_manager._turn_locks
+
+
+@pytest.mark.parametrize("voice", [False, True])
+async def test_closing_stream_releases_session_for_next_turn(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, voice
+):
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry)
+    closed = asyncio.Event()
+
+    async def stream(*args, **kwargs):
+        try:
+            yield StreamChunk(StreamEventType.TEXT, "partial")
+        finally:
+            closed.set()
+
+    method = "_stream_voice_turn" if voice else "_handle_message_stream"
+    with patch.object(agent, method, side_effect=stream):
+        output = (
+            agent.stream_voice_turn("user", "chat", "first")
+            if voice
+            else agent.handle_message_stream("user", "chat", "first")
+        )
+        await anext(output)
+        waiting = asyncio.create_task(agent.handle_message("user", "chat", "second", memory=False))
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        await output.aclose()
+        await waiting
+    assert closed.is_set()
+    assert not session_manager._turn_locks
+
+
+async def test_approval_wait_preserves_tool_results_before_next_turn(settings, mock_llm, session_manager, cost_tracker):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    registry = ToolRegistry()
+
+    async def risky() -> str:
+        return "tool output"
+
+    async def approve(*args):
+        entered.set()
+        await release.wait()
+        return True
+
+    registry.register(name="risky", description="risky", handler=risky, require_approval=True)
+    mock_llm.complete.side_effect = [
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="risky", arguments={})],
+            model="test",
+            input_tokens=10,
+            output_tokens=5,
+            stop_reason="tool_use",
+        ),
+        _DONE,
+        _DONE,
+    ]
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, registry, approval_callback=approve)
+    first = asyncio.create_task(agent.handle_message("user", "chat", "first", memory=False))
+    await entered.wait()
+    second = asyncio.create_task(agent.handle_message("user", "chat", "second", memory=False))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, second)
+    session = await session_manager.get_or_create("user", "chat")
+    roles = [m.role for m in session.messages]
+    assert roles == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL_RESULT,
+        MessageRole.ASSISTANT,
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+    ]
+    assert session.messages[2].tool_call_id == "tc1"
 
 
 @pytest.mark.asyncio

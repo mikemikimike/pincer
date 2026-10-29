@@ -293,3 +293,17 @@ async def test_the_requested_session_is_never_the_one_evicted(capped: SessionMan
         assert capped._cache.get("web:c") is c
     finally:
         failing.clear()
+
+
+async def test_active_turn_is_not_evicted(session_manager):
+    session_manager._max_cached = 1
+    async with session_manager.turn("user", "chat"):
+        original = await session_manager.get_or_create("user", "chat")
+        await session_manager.get_or_create("other", "chat")
+        assert await session_manager.get_or_create("user", "chat") is original
+
+
+async def test_turn_uses_same_unified_key_as_session(session_manager):
+    async with session_manager.turn("user", "chat", pincer_user_id="canonical"):
+        session = await session_manager.get_or_create("user", "chat", pincer_user_id="canonical")
+        assert session.session_id in session_manager._turn_locks

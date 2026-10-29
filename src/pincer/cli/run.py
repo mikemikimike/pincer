@@ -1024,8 +1024,9 @@ async def _start_agent(settings: Settings, lease: DaemonLease | None, shutdown: 
 
         # Special commands
         if incoming.text == "/clear":
-            session = await session_mgr.get_or_create(canonical_id, incoming.channel)
-            await session_mgr.clear(session)
+            async with session_mgr.turn(canonical_id, incoming.channel):
+                session = await session_mgr.get_or_create(canonical_id, incoming.channel)
+                await session_mgr.clear(session)
             return "Conversation cleared."
 
         if incoming.text == "/cost":
