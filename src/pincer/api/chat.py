@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from pincer.api.approvals import (
     request_web_approval,
@@ -61,12 +61,24 @@ class ChatIn(BaseModel):
     # model context. Scoped under the chat user, so whatever value is sent it
     # never reaches anyone else's conversation.
     conversation_id: str | None = Field(default=None, pattern=_UUID_RE.pattern)
+    # False for a request that is not the person talking to Pincer (a call
+    # summary, a knowledge-base question): their long-term memory is neither
+    # searched for it nor written with it, and onboarding leaves it alone.
+    # It needs its own conversation: the conversation stays memory-free from
+    # then on, which the user's main chat must never become.
+    memory: bool = True
 
     @field_validator("conversation_id")
     @classmethod
     def _canonical_uuid(cls, value: str | None) -> str | None:
         """One spelling per id, so a change of case is not a second session."""
         return None if value is None else str(uuid.UUID(value))
+
+    @model_validator(mode="after")
+    def _memory_free_needs_conversation(self) -> ChatIn:
+        if not self.memory and self.conversation_id is None:
+            raise ValueError("memory=false requires a conversation_id")
+        return self
 
 
 class ApprovalIn(BaseModel):
@@ -131,7 +143,11 @@ async def post_message(
     agent = _get_agent(request)
     try:
         resp = await agent.handle_message(
-            user_id, _CHANNEL, body.text, session_key=_conversation_session_key(user_id, body.conversation_id)
+            user_id,
+            _CHANNEL,
+            body.text,
+            session_key=_conversation_session_key(user_id, body.conversation_id),
+            memory=body.memory,
         )
     except BudgetExceededError as e:
         raise HTTPException(402, str(e)) from e
@@ -160,7 +176,11 @@ async def post_stream(
         async def driver() -> None:
             try:
                 async for chunk in agent.handle_message_stream(
-                    user_id, _CHANNEL, body.text, session_key=_conversation_session_key(user_id, body.conversation_id)
+                    user_id,
+                    _CHANNEL,
+                    body.text,
+                    session_key=_conversation_session_key(user_id, body.conversation_id),
+                    memory=body.memory,
                 ):
                     if chunk.type == StreamEventType.TEXT:
                         await queue.put(("chunk", {"delta": chunk.content}))

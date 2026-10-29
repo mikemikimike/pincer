@@ -883,3 +883,76 @@ async def test_other_llm_errors_raise_and_keep_the_history(
 
     assert mock_llm.complete.call_count == 1
     assert [m.content for m in session.messages] == ["earlier", "earlier reply", "hi"]
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["handle_message", "handle_message_stream"])
+async def test_a_turn_without_memory_neither_reads_nor_writes_it(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, streaming
+):
+    """memory=False (a call summary, a knowledge-base question): the user's
+    long-term memory stays out of the prompt, and nothing of the turn is
+    stored there, not even as a session summary."""
+    memory = AsyncMock()
+    memory.search_text.return_value = [SimpleNamespace(content="the user's private fact")]
+    summarizer = Summarizer(mock_llm, memory, session_manager, threshold=2)
+    summarizer.maybe_summarize = AsyncMock(wraps=summarizer.maybe_summarize)
+    agent = Agent(
+        settings, mock_llm, session_manager, cost_tracker, tool_registry, memory_store=memory, summarizer=summarizer
+    )
+
+    for text in ("summarize call one", "summarize call two"):
+        if streaming:
+            chunks = [c async for c in agent.handle_message_stream("user1", "test", text, memory=False)]
+            assert chunks[-1].type == StreamEventType.DONE
+        else:
+            result = await agent.handle_message("user1", "test", text, memory=False)
+            assert "Hello! I'm Pincer." in result.text
+
+    memory.search_text.assert_not_awaited()
+    memory.store_memory.assert_not_awaited()
+    memory.add_profile.assert_not_awaited()
+    summarizer.maybe_summarize.assert_not_awaited()
+    for call in mock_llm.complete.call_args_list:
+        assert "the user's private fact" not in call.kwargs["system"]
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["handle_message", "handle_message_stream"])
+async def test_a_conversation_without_memory_stays_without_it(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry, streaming
+):
+    """A memory-free conversation continued with memory=True is still
+    memory-free: its exchanges never reach long-term memory, summary included."""
+    memory = AsyncMock()
+    summarizer = Summarizer(mock_llm, memory, session_manager, threshold=2)
+    summarizer.maybe_summarize = AsyncMock(wraps=summarizer.maybe_summarize)
+    agent = Agent(
+        settings, mock_llm, session_manager, cost_tracker, tool_registry, memory_store=memory, summarizer=summarizer
+    )
+    key = "test:user1:summary"
+
+    for text, with_memory in (("summarize the call", False), ("and the action items?", True)):
+        if streaming:
+            stream = agent.handle_message_stream("user1", "test", text, session_key=key, memory=with_memory)
+            chunks = [c async for c in stream]
+            assert chunks[-1].type == StreamEventType.DONE
+        else:
+            await agent.handle_message("user1", "test", text, session_key=key, memory=with_memory)
+
+    memory.search_text.assert_not_awaited()
+    memory.store_memory.assert_not_awaited()
+    summarizer.maybe_summarize.assert_not_awaited()
+
+
+async def test_a_turn_with_memory_still_reads_and_writes_it(
+    settings, mock_llm, session_manager, cost_tracker, tool_registry
+):
+    """The default is unchanged: memory is searched and the exchange stored."""
+    memory = AsyncMock()
+    memory.search_text.return_value = [SimpleNamespace(content="the user's private fact")]
+    agent = Agent(settings, mock_llm, session_manager, cost_tracker, tool_registry, memory_store=memory)
+
+    await agent.handle_message("user1", "test", "hello")
+
+    memory.search_text.assert_awaited()
+    memory.store_memory.assert_awaited_once()
+    assert "the user's private fact" in mock_llm.complete.call_args.kwargs["system"]
