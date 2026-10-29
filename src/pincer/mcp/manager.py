@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 
 from pincer.mcp.audit import MCPAuditLogger
-from pincer.mcp.bridge import MCPToolBridge
+from pincer.mcp.bridge import MCPToolBridge, llm_tools
 from pincer.mcp.client import MCPClientSession
 
 if TYPE_CHECKING:
@@ -194,7 +194,7 @@ class MCPClientManager:
                     "transport": srv.transport.value,
                     "enabled": srv.enabled,
                     "connected": session.connected if session else False,
-                    "tool_count": len(session.tools) if session else 0,
+                    "tool_count": len(llm_tools(session.tools)) if session else 0,
                     "instructions": session.instructions if session else None,
                     "disabled": srv.name in self._disabled,
                     "sandbox": srv.sandbox,
@@ -203,9 +203,17 @@ class MCPClientManager:
             )
         return statuses
 
+    def tool_names(self, server_name: str) -> list[str]:
+        """Registry names of the LLM-visible tools a connected server registered ([] otherwise)."""
+        bridge = self._bridges.get(server_name)
+        session = self._sessions.get(server_name)
+        if bridge is None or session is None or not session.connected:
+            return []
+        return bridge.registered_names
+
     def total_tool_count(self) -> int:
         """Total MCP tools currently registered."""
-        return sum(len(s.tools) for s in self._sessions.values() if s.connected)
+        return sum(len(llm_tools(s.tools)) for s in self._sessions.values() if s.connected)
 
     # ── Background tasks ──────────────────────────────────
 

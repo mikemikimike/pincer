@@ -633,6 +633,11 @@ async def _build_core(settings: Settings) -> CoreComponents:
 
         if isinstance(memory_store, MCPMemoryBackend):
             memory_store.set_mcp_manager(mcp_manager)
+    if settings.tool_selection_enabled:
+        from pincer.tools.selection import ToolSelector
+
+        # The index warm-up (start_sync) runs once the caller has registered every tool.
+        agent.tool_selector = ToolSelector(mcp_manager, settings)
 
     return CoreComponents(
         session_mgr=session_mgr,
@@ -1011,6 +1016,8 @@ async def _start_agent(settings: Settings, lease: DaemonLease | None, shutdown: 
     # TODO: channel_map should replaced by router.channels in future but keep stay as is due send_file resolve
     channel_map: dict[str, BaseChannel] = {}
     _register_channel_bound_tools(tools, channel_map)
+    if agent.tool_selector is not None:
+        agent.tool_selector.start_sync(tools.get_schemas())
 
     # MCP server export (optional — exposes Pincer tools to external MCP clients)
     mcp_server = None
@@ -1943,6 +1950,8 @@ async def _run_tasks_worker(settings: Settings) -> None:
     from pincer.tasks.delivery import TASK_RESULTS_CHANNEL, ResultEmitter, create_delivery_backend
 
     core = await _build_core(settings)
+    if core.agent.tool_selector is not None:
+        core.agent.tool_selector.start_sync(core.tools.get_schemas())
 
     proactive = ProactiveAgent(settings.db_path, agent=core.agent)
     await proactive.ensure_table()

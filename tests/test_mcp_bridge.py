@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from pincer.mcp.bridge import (
     MCPToolBridge,
     _convert_schema,
@@ -15,6 +17,7 @@ from pincer.mcp.bridge import (
     _requires_approval,
 )
 from pincer.mcp.config import MCPTransport
+from pincer.mcp.results import raise_on_error, result_json
 
 # ── Helpers / stubs ──────────────────────────────────────────────────────────
 
@@ -31,6 +34,7 @@ class FakeTool:
     description: str = "A test tool"
     inputSchema: dict = field(default_factory=lambda: {"type": "object", "properties": {}})  # noqa: N815
     annotations: FakeAnnotations | None = None
+    meta: dict[str, Any] | None = None
 
 
 @dataclass
@@ -185,6 +189,38 @@ def test_register_tools_adds_to_registry() -> None:
 
     assert count == 1
     assert "testserver__list_repos" in registry.list_tools()
+
+
+def test_register_skips_pincer_internal_tools() -> None:
+    """Tools the server marks pincer_internal (e.g. the tool index) never reach the LLM's registry."""
+    tools = [
+        FakeTool("memory_store", meta={"fastmcp": {"tags": []}}),
+        FakeTool("tool_index_search", meta={"pincer_internal": True, "fastmcp": {"tags": []}}),
+    ]
+    bridge = MCPToolBridge(_make_session(tools, "sqlite_vec_memory"), _make_registry(), _make_audit())
+
+    assert bridge.register_tools() == 1
+    assert bridge.tool_registry.list_tools() == ["sqlite_vec_memory__memory_store"]
+    assert bridge.registered_names == ["sqlite_vec_memory__memory_store"]
+
+
+def test_result_json_reads_structured_content_and_text() -> None:
+    wrapped = MagicMock(structuredContent={"result": [{"id": "1"}]})
+    assert result_json(wrapped) == [{"id": "1"}]
+    obj = MagicMock(structuredContent={"stale": False, "results": []})
+    assert result_json(obj) == {"stale": False, "results": []}
+    text = MagicMock(structuredContent=None, content=[FakeTextContent(text='{"a": 1}')])
+    assert result_json(text) == {"a": 1}
+    empty = MagicMock(structuredContent=None, content=[])
+    assert result_json(empty) is None
+
+
+def test_raise_on_error_names_the_call_and_the_server_text() -> None:
+    ok = MagicMock(isError=False)
+    assert raise_on_error(ok, "x") is ok
+    failed = MagicMock(isError=True, content=[FakeTextContent(text="no such table")])
+    with pytest.raises(RuntimeError, match="tool_index_search failed: no such table"):
+        raise_on_error(failed, "tool_index_search")
 
 
 def test_register_without_prefix() -> None:
