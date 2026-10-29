@@ -77,11 +77,13 @@ def _make_settings(
     whatsapp_self_chat_only: bool = True,
     whatsapp_group_trigger: str = "pincer",
     whatsapp_group_trigger_on_mention: bool = False,
+    whatsapp_group_trigger_on_reply: bool = True,
 ):
     settings = MagicMock()
     settings.whatsapp_self_chat_only = whatsapp_self_chat_only
     settings.whatsapp_group_trigger = whatsapp_group_trigger
     settings.whatsapp_group_trigger_on_mention = whatsapp_group_trigger_on_mention
+    settings.whatsapp_group_trigger_on_reply = whatsapp_group_trigger_on_reply
     settings.data_dir = "/tmp/test"
     settings.openai_api_key.get_secret_value.return_value = "test-key"
     return settings
@@ -100,6 +102,8 @@ def _make_message_event(
     sender_alt_server: str = "",
     msg_id: str = "test-msg-id",
     mentioned_jid: str | None = None,
+    quoted_participant: str | None = None,
+    quoted_id: str = "",
     message_text: str = "hello",
 ):
     """Build a minimal MessageEv-like mock for routing tests."""
@@ -129,10 +133,13 @@ def _make_message_event(
 
     ext = MagicMock()
     ext.text = message_text
-    has_context = mentioned_jid is not None
+    has_context = mentioned_jid is not None or quoted_participant is not None
     if has_context:
         ctx = MagicMock()
-        ctx.mentionedJID = [mentioned_jid]
+        ctx.mentionedJID = [mentioned_jid] if mentioned_jid is not None else []
+        # Set explicitly: an unset MagicMock attribute would be read as a reply.
+        ctx.participant = quoted_participant or ""
+        ctx.stanzaID = quoted_id
         ext.contextInfo = ctx
     else:
         ext.contextInfo = None
@@ -536,6 +543,57 @@ class TestWhatsAppRouting:
         await ch._on_message(MagicMock(), event)
         ch._handler.assert_called_once()
         ch._extract_message.assert_called_once()
+
+    async def test_group_reply_to_pincer_responds(self, routing_channel):
+        """Reply quoting a message Pincer sent, no trigger word → responds."""
+        ch = routing_channel
+        ch._remember_pincer_message(MagicMock(ID="3EB0PINCER"))
+        event, _, _ = _make_message_event(
+            from_me=False,
+            chat_user="group123",
+            sender_user=OTHER_PHONE,
+            is_group=True,
+            quoted_participant=f"{OWNER_PHONE}@s.whatsapp.net",
+            quoted_id="3EB0PINCER",
+            message_text="and tomorrow?",
+        )
+        await ch._on_message(MagicMock(), event)
+        ch._handler.assert_called_once()
+        ch._extract_message.assert_called_once()
+
+    async def test_group_reply_to_the_persons_own_message_ignored(self, routing_channel):
+        """Shared number: a member replying to the person's own message → ignored."""
+        ch = routing_channel
+        ch._remember_pincer_message(MagicMock(ID="3EB0PINCER"))
+        event, _, _ = _make_message_event(
+            from_me=False,
+            chat_user="group123",
+            sender_user=OTHER_PHONE,
+            is_group=True,
+            quoted_participant=f"{OWNER_PHONE}@s.whatsapp.net",
+            quoted_id="3EB0PERSON",
+            message_text="bring wine",
+        )
+        await ch._on_message(MagicMock(), event)
+        ch._handler.assert_not_called()
+        ch._extract_message.assert_not_called()
+
+    async def test_group_owner_reply_to_own_message_ignored(self, routing_channel):
+        """Owner quoting Pincer's (their own number's) message without a trigger word → ignored."""
+        ch = routing_channel
+        ch._remember_pincer_message(MagicMock(ID="3EB0PINCER"))
+        event, _, _ = _make_message_event(
+            from_me=True,
+            chat_user="group123",
+            sender_user=OWNER_PHONE,
+            is_group=True,
+            quoted_participant=f"{OWNER_PHONE}@s.whatsapp.net",
+            quoted_id="3EB0PINCER",
+            message_text="ha, exactly",
+        )
+        await ch._on_message(MagicMock(), event)
+        ch._handler.assert_not_called()
+        ch._extract_message.assert_not_called()
 
     async def test_group_mention_guest_rejected_when_identity_configured(self):
         """Group mention from a sender not in the identity map, guests not allowed → rejected."""

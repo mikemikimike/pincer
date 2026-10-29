@@ -6,8 +6,9 @@ Features:
 - Text messages, voice notes, images, documents
 - Self-chat mode (user messages themselves, agent responds)
 - DM allowlist (only approved phone numbers)
-- Group chat (respond only to a trigger word, or to an @-mention when
-  PINCER_WHATSAPP_GROUP_TRIGGER_ON_MENTION is on)
+- Group chat (respond only to a trigger word, a reply to the bot's message
+  when PINCER_WHATSAPP_GROUP_TRIGGER_ON_REPLY is on (default), or an
+  @-mention when PINCER_WHATSAPP_GROUP_TRIGGER_ON_MENTION is on)
 """
 
 from __future__ import annotations
@@ -193,6 +194,13 @@ class WhatsAppChannel(BaseChannel):
         self._recent_sent_ids: set[str] = set()
         self._recent_sent_ids_order: deque[str] = deque()
         self._max_recent_sent_ids = 100
+        # Ids of messages Pincer sent, kept apart from the echo set above (which
+        # drops each id on its echo) so a group reply quoting one of them is
+        # recognised. In memory only: replies to messages sent before a restart
+        # need a trigger word.
+        self._pincer_message_ids: set[str] = set()
+        self._pincer_message_ids_order: deque[str] = deque()
+        self._max_pincer_message_ids = 1000
 
     @property
     def name(self) -> str:
@@ -350,7 +358,21 @@ class WhatsAppChannel(BaseChannel):
                     self._recent_sent_ids.discard(old)
                 self._recent_sent_ids_order.append(last_id)
                 self._recent_sent_ids.add(last_id)
+            self._remember_pincer_message(result)
         return last_id
+
+    def _remember_pincer_message(self, result: Any) -> None:
+        """Record the id of a message Pincer sent, so replies quoting it trigger."""
+        sid = getattr(result, "ID", None) if result is not None else None
+        if not sid:
+            return
+        sid = str(sid)
+        if sid in self._pincer_message_ids:
+            return
+        while len(self._pincer_message_ids_order) >= self._max_pincer_message_ids:
+            self._pincer_message_ids.discard(self._pincer_message_ids_order.popleft())
+        self._pincer_message_ids_order.append(sid)
+        self._pincer_message_ids.add(sid)
 
     # ── Progress reporting (tool_event_callback bridge) ─────
 
@@ -579,7 +601,7 @@ class WhatsAppChannel(BaseChannel):
 
         jid = await self._jid_for(user_id)
         for chunk in _split_whatsapp_message(text or ""):
-            await self._client.send_message(jid, chunk)
+            self._remember_pincer_message(await self._client.send_message(jid, chunk))
         logger.debug("WhatsApp message sent to %s (%d chars)", user_id, len(text))
 
     async def send_photo(self, user_id: str, url: str, caption: str = "") -> None:
@@ -589,7 +611,7 @@ class WhatsAppChannel(BaseChannel):
 
             raise ChannelNotConnectedError("WhatsApp client not connected")
         jid = await self._jid_for(user_id)
-        await self._client.send_image(jid, url, caption=caption or None)
+        self._remember_pincer_message(await self._client.send_image(jid, url, caption=caption or None))
 
     async def send_photo_from_bytes(
         self,
@@ -604,7 +626,7 @@ class WhatsAppChannel(BaseChannel):
 
             raise ChannelNotConnectedError("WhatsApp client not connected")
         jid = await self._jid_for(user_id)
-        await self._client.send_image(jid, data, caption=caption or None)
+        self._remember_pincer_message(await self._client.send_image(jid, data, caption=caption or None))
 
     async def send_file(self, user_id: str, file_path: str, caption: str = "") -> None:
         """Send a file as a WhatsApp document."""
@@ -619,13 +641,14 @@ class WhatsAppChannel(BaseChannel):
         filename = p.name
         mime, _ = mimetypes.guess_type(filename)
         jid = await self._jid_for(user_id)
-        await self._client.send_document(
+        result = await self._client.send_document(
             jid,
             file_path,
             caption=caption or None,
             filename=filename,
             mimetype=mime or "application/octet-stream",
         )
+        self._remember_pincer_message(result)
 
     async def send_animation(self, user_id: str, url: str, caption: str = "") -> None:
         """Send a GIF/animation — delivered as a looping video on WhatsApp."""
@@ -635,7 +658,7 @@ class WhatsAppChannel(BaseChannel):
             raise ChannelNotConnectedError("WhatsApp client not connected")
         jid = await self._jid_for(user_id)
         try:
-            await self._client.send_video(
+            result = await self._client.send_video(
                 jid,
                 url,
                 caption=caption or None,
@@ -644,7 +667,8 @@ class WhatsAppChannel(BaseChannel):
             )
         except Exception:
             logger.exception("send_animation failed, falling back to image")
-            await self._client.send_image(jid, url, caption=caption or None)
+            result = await self._client.send_image(jid, url, caption=caption or None)
+        self._remember_pincer_message(result)
 
     # ── Event Handlers ───────────────────────────
 
@@ -906,13 +930,15 @@ class WhatsAppChannel(BaseChannel):
                 logger.debug("WA skip: outgoing message to %s → ignoring", chat_jid)
                 return
             elif is_group:
-                # Rule 4: Group — only process if a trigger word is used, or the
-                # bot is @mentioned and whatsapp_group_trigger_on_mention is on.
+                # Rule 4: Group — only process if a trigger word is used, the
+                # message replies to the bot (whatsapp_group_trigger_on_reply,
+                # not counted for our own number), or the bot is @mentioned and
+                # whatsapp_group_trigger_on_mention is on.
                 # This also covers the owner's own messages when Pincer is linked
                 # to the owner's own WhatsApp number (is_from_me=True): previously
                 # Rule 3 dropped these unconditionally, so the owner could never
                 # summon Pincer in a group the way any other member could.
-                if not self._is_addressed_in_group(msg):
+                if not self._is_addressed_in_group(msg, from_me=is_from_me):
                     return
                 if is_from_me:
                     # Unambiguously the owner — bypass the guest gate, which
@@ -992,9 +1018,11 @@ class WhatsAppChannel(BaseChannel):
             if approval_fut and not approval_fut.done():
                 decision = self._parse_yes_no(incoming.text)
                 if decision is None:
-                    await client.send_message(
-                        build_jid(chat_user, source.Chat.Server),
-                        "Please reply *yes* or *no*.",
+                    self._remember_pincer_message(
+                        await client.send_message(
+                            build_jid(chat_user, source.Chat.Server),
+                            "Please reply *yes* or *no*.",
+                        )
                     )
                     return
                 approval_fut.set_result(decision)
@@ -1034,6 +1062,7 @@ class WhatsAppChannel(BaseChannel):
                     reply_jid = build_jid(chat_user, source.Chat.Server)
                     for chunk in _split_whatsapp_message(response):
                         result = await client.send_message(reply_jid, chunk)
+                        self._remember_pincer_message(result)
                         sent_id = getattr(result, "ID", None) if result is not None else None
                         if sent_id is not None:
                             sid = str(sent_id)
@@ -1216,8 +1245,15 @@ class WhatsAppChannel(BaseChannel):
 
     # ── Group Trigger Detection ──────────────────
 
-    def _is_addressed_in_group(self, msg: WAMessage) -> bool:
-        """True if a group message triggers Pincer; logs why when it doesn't."""
+    def _is_addressed_in_group(self, msg: WAMessage, *, from_me: bool = False) -> bool:
+        """True if a group message triggers Pincer; logs why when it doesn't.
+
+        ``from_me`` marks a message sent from our own number. On a shared
+        personal number, Pincer's answers and the person's own messages carry
+        the same identity, so a reply from our number to our number is the
+        person commenting on Pincer's answer (or their own message), not a
+        prompt; only trigger words and mentions count for it.
+        """
         # Text-bearing payloads: plain text, and captioned media the extract
         # path forwards to the agent (image and document captions). Video has
         # no content path, so its caption must not pass the gate.
@@ -1236,21 +1272,42 @@ class WhatsAppChannel(BaseChannel):
                         ctx = media.contextInfo
                     break
 
-        # Trigger words apply either way; mentions are opt-in.
+        # Trigger words apply either way; replies are on by default, mentions opt-in.
         if matches_group_trigger(text, self._settings.whatsapp_group_trigger):
             return True
-        if not self._mentions_self(text, ctx):
-            logger.debug("WA skip: group message without trigger word or mention")
-            return False
-        if not self._settings.whatsapp_group_trigger_on_mention:
-            logger.debug("WA skip: group @-mention ignored, PINCER_WHATSAPP_GROUP_TRIGGER_ON_MENTION is off")
-            return False
-        return True
+        # Log only once the message is skipped, so a reply that also carries a
+        # trigger word or mention doesn't log a misleading skip.
+        skip_reason = "group message without trigger word, mention or reply"
+        if self._replies_to_self(ctx):
+            if from_me:
+                skip_reason = "group reply from our own number ignored, use a trigger word"
+            elif self._settings.whatsapp_group_trigger_on_reply:
+                return True
+            else:
+                skip_reason = "group reply ignored, PINCER_WHATSAPP_GROUP_TRIGGER_ON_REPLY is off"
+        if self._mentions_self(text, ctx):
+            if self._settings.whatsapp_group_trigger_on_mention:
+                return True
+            skip_reason = "group @-mention ignored, PINCER_WHATSAPP_GROUP_TRIGGER_ON_MENTION is off"
+        logger.debug("WA skip: %s", skip_reason)
+        return False
 
-    def _mentions_self(self, text: str, ctx: Any) -> bool:
+    def _own_ids(self) -> set[str]:
         # The @-picker inserts the phone number in classic groups and the LID
         # in LID-addressed groups, so accept either of our own identifiers.
-        own_ids = {own_id for own_id in (self._own_jid, self._own_lid) if own_id}
+        return {own_id for own_id in (self._own_jid, self._own_lid) if own_id}
+
+    def _replies_to_self(self, ctx: Any) -> bool:
+        # A quoting message carries the quoted message's id in
+        # ContextInfo.stanzaID. Match it against what Pincer itself sent, not
+        # the quoted author: on a shared personal number the author id is also
+        # the person, and members replying to the person must not reach Pincer.
+        if ctx is None or not ctx.stanzaID:
+            return False
+        return str(ctx.stanzaID) in self._pincer_message_ids
+
+    def _mentions_self(self, text: str, ctx: Any) -> bool:
+        own_ids = self._own_ids()
 
         if ctx is not None and ctx.mentionedJID:
             for jid in ctx.mentionedJID:

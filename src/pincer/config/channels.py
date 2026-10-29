@@ -20,6 +20,20 @@ class ChannelSettings(BaseModel):
             "(whole-word, case-insensitive; `@name` requires the @)"
         ),
     )
+    telegram_group_trigger_on_mention: bool = Field(
+        default=False,
+        description=(
+            "In group chats, also reply when the bot is @-mentioned (`@BotName`). "
+            "Trigger words from telegram_group_trigger and `/cmd@BotName` commands apply either way."
+        ),
+    )
+    telegram_group_trigger_on_reply: bool = Field(
+        default=True,
+        description=(
+            "In group chats, also reply when a message replies to one of the bot's messages. "
+            "Trigger words from telegram_group_trigger apply either way."
+        ),
+    )
 
     # ── Discord ───────────────────────────────────────────
     discord_bot_token: SecretStr = Field(default=SecretStr(""), description="Discord bot token")
@@ -58,6 +72,15 @@ class ChannelSettings(BaseModel):
         description=(
             "In group chats, also reply when the bot is picked in WhatsApp's @-picker "
             "(phone number or LID). Trigger words from whatsapp_group_trigger apply either way."
+        ),
+    )
+    whatsapp_group_trigger_on_reply: bool = Field(
+        default=True,
+        description=(
+            "In group chats, also reply when a message quotes a message the bot sent "
+            "(matched on message id, last 1000 in memory; the person's own replies on a "
+            "shared personal number never count). "
+            "Trigger words from whatsapp_group_trigger apply either way."
         ),
     )
     whatsapp_show_progress: bool = Field(
