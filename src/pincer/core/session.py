@@ -7,10 +7,12 @@ Stores message history, supports trimming, and provides context for the agent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -20,6 +22,7 @@ from pincer.services.onboarding import OnboardingService
 from pincer.services.sessions import SessionService
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,14 @@ _EVICTION_SPARE_ATTEMPTS = 2
 
 def _session_key(user_id: str, channel: str) -> str:
     return f"{channel}:{user_id}"
+
+
+def _resolve_session_key(user_id: str, channel: str, pincer_user_id: str = "", session_key: str | None = None) -> str:
+    if session_key:
+        return session_key
+    if pincer_user_id:
+        return _session_key(pincer_user_id, "unified")
+    return _session_key(user_id, channel)
 
 
 def conversation_key(user_id: str, channel: str, conversation_id: str) -> str:
@@ -97,6 +108,25 @@ class SessionManager:
         self._service: SessionService | None = None
         self._onboarding: OnboardingService | None = None
         self._cache: OrderedDict[str, Session] = OrderedDict()
+        self._turn_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+
+    @asynccontextmanager
+    async def turn(
+        self, user_id: str, channel: str, session_key: str | None = None, pincer_user_id: str = ""
+    ) -> AsyncIterator[None]:
+        """Serialize turns and pin their session while they are active or queued."""
+        key = _resolve_session_key(user_id, channel, pincer_user_id, session_key)
+        lock, users = self._turn_locks.get(key, (asyncio.Lock(), 0))
+        self._turn_locks[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            current_lock, users = self._turn_locks[key]
+            if users == 1:
+                del self._turn_locks[key]
+            else:
+                self._turn_locks[key] = (current_lock, users - 1)
 
     async def initialize(self) -> None:
         """Bring the database to head and attach the store.
@@ -149,12 +179,7 @@ class SessionManager:
         ``session_key`` overrides both with an exact key (a phone call's
         session, which must not depend on how its user was resolved).
         """
-        if session_key:
-            key = session_key
-        elif pincer_user_id:
-            key = _session_key(pincer_user_id, "unified")
-        else:
-            key = _session_key(user_id, channel)
+        key = _resolve_session_key(user_id, channel, pincer_user_id, session_key)
 
         if key in self._cache:
             self._cache.move_to_end(key)
@@ -257,6 +282,9 @@ class SessionManager:
             key, session = next(iter(self._cache.items()))
             if key == keep:
                 return  # everything older was tried
+            if key in self._turn_locks:
+                self._cache.move_to_end(key)
+                continue
             try:
                 await self._persist(session, only_if_changed=True)
             except Exception:
@@ -269,7 +297,12 @@ class SessionManager:
                     self._cache.move_to_end(key)
                 continue
             session._eviction_failed = False
-            if next(iter(self._cache), None) == key and self._cache[key] is session and not _changed(session):
+            if (
+                key not in self._turn_locks
+                and next(iter(self._cache), None) == key
+                and self._cache[key] is session
+                and not _changed(session)
+            ):
                 del self._cache[key]
 
     async def _persist(self, session: Session, *, only_if_changed: bool = False) -> None:

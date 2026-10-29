@@ -175,21 +175,24 @@ async def post_stream(
 
         async def driver() -> None:
             try:
-                async for chunk in agent.handle_message_stream(
-                    user_id,
-                    _CHANNEL,
-                    body.text,
-                    session_key=_conversation_session_key(user_id, body.conversation_id),
-                    memory=body.memory,
-                ):
-                    if chunk.type == StreamEventType.TEXT:
-                        await queue.put(("chunk", {"delta": chunk.content}))
-                    elif chunk.type == StreamEventType.TOOL_START:
-                        await queue.put(("tool", {"phase": "start", "name": chunk.content}))
-                    elif chunk.type == StreamEventType.TOOL_DONE:
-                        await queue.put(("tool", {"phase": "done", "name": chunk.content}))
-                    elif chunk.type == StreamEventType.DONE:
-                        await queue.put(("done", {"text": chunk.content}))
+                async with contextlib.aclosing(
+                    agent.handle_message_stream(
+                        user_id,
+                        _CHANNEL,
+                        body.text,
+                        session_key=_conversation_session_key(user_id, body.conversation_id),
+                        memory=body.memory,
+                    )
+                ) as stream:
+                    async for chunk in stream:
+                        if chunk.type == StreamEventType.TEXT:
+                            await queue.put(("chunk", {"delta": chunk.content}))
+                        elif chunk.type == StreamEventType.TOOL_START:
+                            await queue.put(("tool", {"phase": "start", "name": chunk.content}))
+                        elif chunk.type == StreamEventType.TOOL_DONE:
+                            await queue.put(("tool", {"phase": "done", "name": chunk.content}))
+                        elif chunk.type == StreamEventType.DONE:
+                            await queue.put(("done", {"text": chunk.content}))
             except BudgetExceededError as e:
                 await queue.put(("error", {"message": f"Warning: Daily budget — {e}"}))
             except LLMError as e:

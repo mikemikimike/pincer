@@ -53,7 +53,7 @@ ApprovalCallback = Callable[[str, dict[str, Any], str, str], Awaitable[bool]]
 ToolEventCallback = Callable[[str, str, dict[str, Any], str, str], Awaitable[None]]
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from pincer.config import Settings
     from pincer.core.session import Session, SessionManager
@@ -489,6 +489,23 @@ class Agent:
         session_key: str | None = None,
         memory: bool = True,
     ) -> AgentResponse:
+        async with self._sessions.turn(user_id, channel, session_key):
+            return await self._handle_message(
+                user_id, channel, text, images, channel_user_id, channel_name, extra_system, session_key, memory
+            )
+
+    async def _handle_message(
+        self,
+        user_id: str,
+        channel: str,
+        text: str,
+        images: list[tuple[bytes, str]] | None = None,
+        channel_user_id: str | None = None,
+        channel_name: str | None = None,
+        extra_system: str | None = None,
+        session_key: str | None = None,
+        memory: bool = True,
+    ) -> AgentResponse:
         """
         Main entry point: process a user message and return agent's response.
 
@@ -870,7 +887,28 @@ class Agent:
         channel_user_id: str | None = None,
         session_key: str | None = None,
         memory: bool = True,
-    ) -> AsyncIterator[StreamChunk]:
+    ) -> AsyncGenerator[StreamChunk]:
+        from contextlib import aclosing
+
+        async with (
+            self._sessions.turn(user_id, channel, session_key),
+            aclosing(
+                self._handle_message_stream(user_id, channel, text, images, channel_user_id, session_key, memory)
+            ) as stream,
+        ):
+            async for chunk in stream:
+                yield chunk
+
+    async def _handle_message_stream(
+        self,
+        user_id: str,
+        channel: str,
+        text: str,
+        images: list[tuple[bytes, str]] | None = None,
+        channel_user_id: str | None = None,
+        session_key: str | None = None,
+        memory: bool = True,
+    ) -> AsyncGenerator[StreamChunk]:
         """
         Process a user message, yielding StreamChunks as the response is generated.
 
@@ -1051,7 +1089,37 @@ class Agent:
         channel_user_id: str | None = None,
         timings: dict[str, Any] | None = None,
         session_key: str | None = None,
-    ) -> AsyncIterator[StreamChunk]:
+    ) -> AsyncGenerator[StreamChunk]:
+        from contextlib import aclosing
+
+        async with (
+            self._sessions.turn(user_id, channel, session_key),
+            aclosing(
+                self._stream_voice_turn(
+                    user_id,
+                    channel,
+                    text,
+                    extra_system=extra_system,
+                    channel_user_id=channel_user_id,
+                    timings=timings,
+                    session_key=session_key,
+                )
+            ) as stream,
+        ):
+            async for chunk in stream:
+                yield chunk
+
+    async def _stream_voice_turn(
+        self,
+        user_id: str,
+        channel: str,
+        text: str,
+        *,
+        extra_system: str | None = None,
+        channel_user_id: str | None = None,
+        timings: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> AsyncGenerator[StreamChunk]:
         """One live phone-call turn, streamed (Sprint 5, T5.2).
 
         Differences from handle_message_stream, all latency- or call-driven:
